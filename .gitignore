@@ -2,3 +2,16 @@
 **/*.rs.bk
 *.tar
 *.log
+
+# Editor and OS artifacts
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Internal agent planning artifacts (not shipped)
+AGENT_HANDOFF.md
+HANDOFF.md
+.agents/

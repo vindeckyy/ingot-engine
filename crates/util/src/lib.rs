@@ -1,8 +1,9 @@
 //! Shared helpers: ids, digests, docker-style random names, small fs utils.
 
-pub mod id;
-pub mod name;
 pub mod digest;
+pub mod id;
+pub mod ignore;
+pub mod name;
 
 pub use digest::{digest_hex, sha256_hex};
 pub use id::random_token;
@@ -16,8 +17,7 @@ pub fn new_id() -> String {
 }
 
 pub fn ensure_dir(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path)
-        .with_context(|| format!("create dir {}", path.display()))
+    std::fs::create_dir_all(path).with_context(|| format!("create dir {}", path.display()))
 }
 
 pub fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {

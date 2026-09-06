@@ -16,17 +16,23 @@ pub struct PullHandle {
 
 /// Run the pull pipeline. Progress JSON lines are sent on `tx`; the receiver
 /// (HTTP handler) forwards them to the client. Returns the image id.
+/// `platform` (`os/arch`) overrides the daemon default (unit 4.1).
 pub async fn pull(
     client: Arc<RegistryClient>,
     store: Arc<ImageStore>,
     image: ImageRef,
     auth: Option<ingot_api::AuthConfig>,
+    platform: Option<(String, String)>,
     tx: mpsc::Sender<ProgressMessage>,
 ) -> Result<String> {
-    send(&tx, ProgressMessage::status(format!("Pulling from {}", image.display_ref()))).await;
+    send(
+        &tx,
+        ProgressMessage::status(format!("Pulling from {}", image.display_ref())),
+    )
+    .await;
 
     let (manifest, top_digest) = client
-        .fetch_manifest(&image, auth.as_ref())
+        .fetch_manifest(&image, auth.as_ref(), platform)
         .await
         .map_err(|e| {
             let _ = tx.try_send(ProgressMessage::error(format!("{e:#}")));
@@ -36,11 +42,17 @@ pub async fn pull(
     // ---- config blob ----
     let config_digest = manifest.config_digest.clone();
     let _ = client
-        .fetch_blob_to_file(&image, &config_digest, &store.blob_path(&config_digest), auth.as_ref())
+        .fetch_blob_to_file(
+            &image,
+            &config_digest,
+            &store.blob_path(&config_digest),
+            auth.as_ref(),
+            &manifest.endpoint,
+        )
         .await?;
     let config_bytes = tokio::fs::read(store.blob_path(&config_digest)).await?;
-    let oci_config: OciImageConfig = serde_json::from_slice(&config_bytes)
-        .map_err(|e| anyhow!("parse image config: {e}"))?;
+    let oci_config: OciImageConfig =
+        serde_json::from_slice(&config_bytes).map_err(|e| anyhow!("parse image config: {e}"))?;
 
     // ---- layers (bounded parallel download, then ordered unpack) ----
     let mut blobs = Vec::with_capacity(manifest.layers.len());
@@ -48,6 +60,7 @@ pub async fn pull(
     let mut downloaded: i64 = 0;
 
     let sem = Arc::new(tokio::sync::Semaphore::new(3));
+    let blob_endpoint = manifest.endpoint.clone();
     let mut tasks = Vec::with_capacity(manifest.layers.len());
     for (idx, layer) in manifest.layers.iter().enumerate() {
         let permit = Arc::clone(&sem);
@@ -56,33 +69,58 @@ pub async fn pull(
         let auth = auth.clone();
         let store = Arc::clone(&store);
         let tx = tx.clone();
+        let endpoint = blob_endpoint.clone();
         let size = layer.size;
         let digest = layer.digest.clone();
         let media = layer.media_type.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = permit.acquire_owned().await;
-            send(&tx, ProgressMessage {
-                id: Some(format!("layer-{}", digest.chars().take(12).collect::<String>())),
-                status: Some("Pulling fs layer".into()),
-                ..Default::default()
-            })
+            send(
+                &tx,
+                ProgressMessage {
+                    id: Some(format!(
+                        "layer-{}",
+                        digest.chars().take(12).collect::<String>()
+                    )),
+                    status: Some("Pulling fs layer".into()),
+                    ..Default::default()
+                },
+            )
             .await;
-            send(&tx, ProgressMessage {
-                id: Some(short(&digest)),
-                status: Some("Downloading".into()),
-                progressDetail: Some(ingot_api::ProgressDetail { current: 0, total: size }),
-                ..Default::default()
-            })
+            send(
+                &tx,
+                ProgressMessage {
+                    id: Some(short(&digest)),
+                    status: Some("Downloading".into()),
+                    progressDetail: Some(ingot_api::ProgressDetail {
+                        current: 0,
+                        total: size,
+                    }),
+                    ..Default::default()
+                },
+            )
             .await;
             let n = client
-                .fetch_blob_to_file(&image, &digest, &store.blob_path(&digest), auth.as_ref())
+                .fetch_blob_to_file(
+                    &image,
+                    &digest,
+                    &store.blob_path(&digest),
+                    auth.as_ref(),
+                    &endpoint,
+                )
                 .await?;
-            send(&tx, ProgressMessage {
-                id: Some(short(&digest)),
-                status: Some("Download complete".into()),
-                progressDetail: Some(ingot_api::ProgressDetail { current: n as i64, total: n as i64 }),
-                ..Default::default()
-            })
+            send(
+                &tx,
+                ProgressMessage {
+                    id: Some(short(&digest)),
+                    status: Some("Download complete".into()),
+                    progressDetail: Some(ingot_api::ProgressDetail {
+                        current: n as i64,
+                        total: n as i64,
+                    }),
+                    ..Default::default()
+                },
+            )
             .await;
             Ok::<(usize, String, String, i64), anyhow::Error>((idx, digest, media, n as i64))
         }));
@@ -97,7 +135,6 @@ pub async fn pull(
         downloaded += n;
         blobs.push((digest, media));
     }
-    let _ = total;
 
     // ---- unpack in order ----
     let mut diff_ids = Vec::with_capacity(blobs.len());
@@ -107,29 +144,65 @@ pub async fn pull(
             .await
             .with_context(|| format!("unpack layer {i}"))?;
         diff_ids.push(diff.clone());
-        send(&tx, ProgressMessage {
-            id: Some(short(digest)),
-            status: Some("Extracting".into()),
-            progressDetail: Some(ingot_api::ProgressDetail { current: i as i64, total: blobs.len() as i64 }),
-            ..Default::default()
-        })
+        send(
+            &tx,
+            ProgressMessage {
+                id: Some(short(digest)),
+                status: Some("Extracting".into()),
+                progressDetail: Some(ingot_api::ProgressDetail {
+                    current: i as i64,
+                    total: blobs.len() as i64,
+                }),
+                ..Default::default()
+            },
+        )
         .await;
     }
-    send(&tx, ProgressMessage {
-        status: Some("Pull complete".into()),
-        ..Default::default()
-    })
+    // Cross-check unpacked content against the image config's rootfs
+    // descriptor: every unpacked diffID must appear in the config list in
+    // order. (The config may list extra empty-layer entries, so this is a
+    // subsequence check, not an equality check.) A mismatch means a corrupt
+    // layer or a tampered store.
+    if !oci_config.rootfs.typ.is_empty() && oci_config.rootfs.typ != "layers" {
+        anyhow::bail!(
+            "unsupported rootfs type {:?} for {}",
+            oci_config.rootfs.typ,
+            image.display_ref()
+        );
+    }
+    if !oci_config.rootfs.diff_ids.is_empty() {
+        let mut want = oci_config.rootfs.diff_ids.iter();
+        for got in &diff_ids {
+            if !want.any(|w| w == got) {
+                anyhow::bail!(
+                    "layer diffID mismatch for {}: unpacked layer {got} not listed in image config",
+                    image.display_ref()
+                );
+            }
+        }
+    }
+    send(
+        &tx,
+        ProgressMessage {
+            status: Some("Pull complete".into()),
+            progressDetail: Some(ingot_api::ProgressDetail {
+                current: downloaded,
+                total,
+            }),
+            ..Default::default()
+        },
+    )
     .await;
 
     // ---- image record ----
-    let size: i64 = manifest.layers.iter().map(|l| l.size).sum::<i64>() + config_bytes.len() as i64
+    let size: i64 = manifest.layers.iter().map(|l| l.size).sum::<i64>()
+        + config_bytes.len() as i64
         + manifest.media_type.len() as i64;
     let repo_digest = format!("{}@{}", image.display_ref_no_tag(), top_digest);
-    let tag_key = image.tag_key();
     let record = ImageRecord {
         id: config_digest.trim_start_matches("sha256:").to_string(),
         manifest_digest: top_digest.clone(),
-        repo_tags: vec![tag_key],
+        repo_tags: image.tag_key_opt().into_iter().collect(),
         repo_digests: vec![repo_digest],
         created: oci_config.created.clone().unwrap_or_default(),
         created_unix: parse_rfc3339_or_zero(&oci_config.created),
@@ -146,29 +219,17 @@ pub async fn pull(
         chain_ids: ImageRecord::compute_chain_ids(&diff_ids),
     };
 
-    // Merge tags if the image already exists under another tag.
+    // Merge tags/digests if the image already exists under another tag.
     let id = record.id.clone();
-    if let Some(existing) = store.load(&id).await? {
-        let mut merged = record;
-        for t in existing.repo_tags {
-            if !merged.repo_tags.contains(&t) {
-                merged.repo_tags.push(t);
-            }
-        }
-        for d in existing.repo_digests {
-            if !merged.repo_digests.contains(&d) {
-                merged.repo_digests.push(d);
-            }
-        }
-        store.put_image(&merged).await?;
-    } else {
-        store.put_image(&record).await?;
-    }
+    store.put_image_merged(&record).await?;
 
-    send(&tx, ProgressMessage::status(format!(
-        "Downloaded newer image for {}",
-        image.display_ref()
-    )))
+    send(
+        &tx,
+        ProgressMessage::status(format!(
+            "Downloaded newer image for {}",
+            image.display_ref()
+        )),
+    )
     .await;
     Ok(id)
 }
@@ -207,6 +268,8 @@ pub struct OciImageConfig {
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 #[serde(default)]
+// Field names mirror the OCI image config JSON verbatim.
+#[allow(non_snake_case)]
 pub struct OciRuntimeConfig {
     #[serde(default)]
     Env: Vec<String>,

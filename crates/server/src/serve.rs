@@ -22,9 +22,7 @@ pub async fn serve(state: SharedState, socket: &Path) -> Result<()> {
     tracing::info!("listening on {}", sock_path.display());
 
     let app = build_router(state);
-    axum::serve(listener, app)
-        .await
-        .context("server loop")
+    axum::serve(listener, app).await.context("server loop")
 }
 
 fn apply_socket_perms(path: &Path) -> Result<()> {

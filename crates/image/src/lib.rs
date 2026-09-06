@@ -1,11 +1,12 @@
 //! Image content store: blobs, unpacked layers (diffIDs/chainIDs), image
 //! records, tag index, and the pull pipeline.
 
-pub mod unpack;
-pub mod store;
+pub mod fsck;
 pub mod pull;
+pub mod store;
+pub mod unpack;
 
-pub use store::{ImageStore, ImageRecord};
+pub use store::{ImageRecord, ImageStore};
 
 use anyhow::Result;
 use std::path::Path;

@@ -4,7 +4,7 @@
 
 use crate::child::ChildContext;
 use crate::overlay;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use ingot_store::paths::DataPaths;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
@@ -20,13 +20,21 @@ pub struct StepOptions {
     pub context_root: PathBuf,
     /// Extra bind mounts: (source, destination-in-container).
     pub binds: Vec<(PathBuf, String)>,
+    /// Read-only bind mounts, remounted MS_RDONLY after the bind
+    /// (build secrets: readable inside the step, never writable).
+    pub binds_ro: Vec<(PathBuf, String)>,
 }
 
 /// Run `argv` in the prepared rootfs. Returns (exit code, combined output).
 pub fn run_step(paths: &DataPaths, id: &str, opts: StepOptions) -> Result<(i32, String)> {
     let merged = opts.work_root.join("merged");
     std::fs::create_dir_all(&merged)?;
-    overlay::mount_overlay(&opts.lowerdirs, &merged, &opts.work_root.join("diff"), &opts.work_root.join("work"))?;
+    overlay::mount_overlay(
+        &opts.lowerdirs,
+        &merged,
+        &opts.work_root.join("diff"),
+        &opts.work_root.join("work"),
+    )?;
 
     // /etc files for the build env.
     std::fs::create_dir_all(merged.join("etc"))?;
@@ -36,41 +44,85 @@ pub fn run_step(paths: &DataPaths, id: &str, opts: StepOptions) -> Result<(i32, 
     std::fs::write(etc.join("hosts"), "127.0.0.1\tlocalhost\n")?;
     std::fs::write(etc.join("hostname"), format!("{}\n", id))?;
 
-    // Bind mounts (e.g. build context) into the rootfs.
-    for (src, dest) in &opts.binds {
+    // Bind mounts (e.g. build context) into the rootfs. File sources
+    // get a file target (parent dirs + touch); directory sources get a
+    // directory target. Read-only mounts are remounted MS_RDONLY after
+    // the bind so the step cannot alter (or truncate) the source.
+    for (src, dest, readonly) in opts
+        .binds
+        .iter()
+        .map(|(s, d)| (s, d, false))
+        .chain(opts.binds_ro.iter().map(|(s, d)| (s, d, true)))
+    {
         let target = merged.join(dest.trim_start_matches('/'));
-        std::fs::create_dir_all(&target)?;
-        let s = std::ffi::CString::new(src.as_os_str().as_encoded_bytes().to_vec())?;
-        let d = std::ffi::CString::new(target.as_os_str().as_encoded_bytes().to_vec())?;
-        let rc = unsafe { libc::mount(s.as_ptr(), d.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) };
-        if rc != 0 {
-            return Err(anyhow!("bind {} → {}: {}", src.display(), dest, std::io::Error::last_os_error()));
+        if src.is_file() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::File::create(&target)?;
+        } else {
+            std::fs::create_dir_all(&target)?;
+        }
+        bind_one(src, &target, dest)?;
+        if readonly {
+            let d = std::ffi::CString::new(target.as_os_str().as_encoded_bytes().to_vec())?;
+            let rc = unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    d.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                    std::ptr::null(),
+                )
+            };
+            if rc != 0 {
+                return Err(anyhow!(
+                    "bind(ro) {} → {}: {}",
+                    src.display(),
+                    dest,
+                    std::io::Error::last_os_error()
+                ));
+            }
         }
     }
 
     let (ready_tx, ready_rx) = std::os::unix::net::UnixStream::pair()?;
-    let (out_r, out_w) = os_pipe_pair()?;
-    let (in_r, _in_w) = os_pipe_pair()?;
-    drop(_in_w); // child stdin = immediate EOF
+    let (out_r, out_w) = crate::stdio::os_pipe_pair()?;
+    let (in_r, in_w) = crate::stdio::os_pipe_pair()?;
+    // Child stdin is immediate EOF: close the write end for real (a plain
+    // `drop` on a raw fd would leak it).
+    unsafe {
+        libc::close(in_w);
+    }
 
     let env: Vec<String> = opts
         .env
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
-        .chain(std::iter::once("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()))
+        .chain(std::iter::once(
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        ))
         .chain(std::iter::once("HOME=/root".to_string()))
         .collect();
 
     let ctx = ChildContext {
         ready_pipe_rd: ready_rx.as_raw_fd(),
+        exec_pipe_wr: -1,
         stdin_fd: in_r,
         stdout_fd: out_w,
         stderr_fd: out_w, // combined like docker build
         merged: std::ffi::CString::new(merged.as_os_str().as_encoded_bytes().to_vec())?,
         hostname: std::ffi::CString::new("build")?,
-        resolv: std::ffi::CString::new(etc.join("resolv.conf").as_os_str().as_encoded_bytes().to_vec())?,
+        resolv: std::ffi::CString::new(
+            etc.join("resolv.conf")
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec(),
+        )?,
         hosts: std::ffi::CString::new(etc.join("hosts").as_os_str().as_encoded_bytes().to_vec())?,
-        hostname_file: std::ffi::CString::new(etc.join("hostname").as_os_str().as_encoded_bytes().to_vec())?,
+        hostname_file: std::ffi::CString::new(
+            etc.join("hostname").as_os_str().as_encoded_bytes().to_vec(),
+        )?,
         argv: opts
             .argv
             .iter()
@@ -80,7 +132,11 @@ pub fn run_step(paths: &DataPaths, id: &str, opts: StepOptions) -> Result<(i32, 
             .iter()
             .map(|e| std::ffi::CString::new(e.as_str()))
             .collect::<std::result::Result<Vec<_>, _>>()?,
-        workdir: std::ffi::CString::new(if opts.workdir.is_empty() { "/" } else { &opts.workdir })?,
+        workdir: std::ffi::CString::new(if opts.workdir.is_empty() {
+            "/"
+        } else {
+            &opts.workdir
+        })?,
         user_raw: std::ffi::CString::new("")?,
         uid: u32::MAX,
         gid: u32::MAX,
@@ -93,16 +149,29 @@ pub fn run_step(paths: &DataPaths, id: &str, opts: StepOptions) -> Result<(i32, 
         bring_lo_up: false,
         has_netns: true,
         tty: false,
+        shm_size: 0,
+        tmpfs: vec![],
+        sysctls: vec![],
+        ulimits: vec![],
     };
 
     let ctx_ptr = ctx.into_raw() as *mut libc::c_void;
-    let clone_flags = (libc::SIGCHLD | libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWUTS
-        | libc::CLONE_NEWIPC | libc::CLONE_NEWNET) as i32;
+    let clone_flags = libc::SIGCHLD
+        | libc::CLONE_NEWNS
+        | libc::CLONE_NEWPID
+        | libc::CLONE_NEWUTS
+        | libc::CLONE_NEWIPC
+        | libc::CLONE_NEWNET;
     let pid = unsafe {
         const STACK: usize = 8 * 1024 * 1024;
         let mut stack = vec![0u8; STACK];
         let top = ((stack.as_mut_ptr() as usize) + STACK - 16) & !0xF;
-        libc::clone(crate::child::clone_entry, top as *mut libc::c_void, clone_flags, ctx_ptr)
+        libc::clone(
+            crate::child::clone_entry,
+            top as *mut libc::c_void,
+            clone_flags,
+            ctx_ptr,
+        )
     };
     if pid < 0 {
         unsafe {
@@ -117,7 +186,7 @@ pub fn run_step(paths: &DataPaths, id: &str, opts: StepOptions) -> Result<(i32, 
     {
         use std::io::Write;
         let mut tx = ready_tx;
-        let _ = tx.write_all(&[b'g']); // no network setup needed for build steps
+        let _ = tx.write_all(b"g"); // no network setup needed for build steps
     }
     unsafe {
         libc::close(out_w);
@@ -148,7 +217,7 @@ pub fn run_step(paths: &DataPaths, id: &str, opts: StepOptions) -> Result<(i32, 
     };
     let output = String::from_utf8_lossy(&reader.join().unwrap_or_default()).to_string();
 
-    for (_, dest) in opts.binds.iter().rev() {
+    for (_, dest) in opts.binds.iter().chain(opts.binds_ro.iter()).rev() {
         let target = merged.join(dest.trim_start_matches('/'));
         let _ = nix::mount::umount2(&target, nix::mount::MntFlags::MNT_DETACH);
     }
@@ -157,15 +226,30 @@ pub fn run_step(paths: &DataPaths, id: &str, opts: StepOptions) -> Result<(i32, 
     Ok((code, output))
 }
 
-fn host_resolv() -> String {
-    std::fs::read_to_string("/etc/resolv.conf").unwrap_or_else(|_| "nameserver 8.8.8.8\n".into())
+/// One MS_BIND mount of `src` onto `target`.
+fn bind_one(src: &std::path::Path, target: &std::path::Path, dest: &str) -> Result<()> {
+    let s = std::ffi::CString::new(src.as_os_str().as_encoded_bytes().to_vec())?;
+    let d = std::ffi::CString::new(target.as_os_str().as_encoded_bytes().to_vec())?;
+    let rc = unsafe {
+        libc::mount(
+            s.as_ptr(),
+            d.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow!(
+            "bind {} → {}: {}",
+            src.display(),
+            dest,
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
-fn os_pipe_pair() -> Result<(i32, i32)> {
-    let mut fds = [0i32; 2];
-    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    if rc != 0 {
-        return Err(anyhow!("pipe2: {}", std::io::Error::last_os_error()));
-    }
-    Ok((fds[0], fds[1]))
+fn host_resolv() -> String {
+    std::fs::read_to_string("/etc/resolv.conf").unwrap_or_else(|_| "nameserver 8.8.8.8\n".into())
 }

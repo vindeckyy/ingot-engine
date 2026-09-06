@@ -56,6 +56,7 @@ percent-encoding = "2"
 regex = "1"
 tempfile = "3"
 byteorder = "1"
+tower = { version = "0.5", features = ["util"] }
 
 # internal
 ingot-util = { path = "crates/util" }

@@ -185,7 +185,10 @@ pub struct LogConfig {
 
 impl Default for RestartPolicy {
     fn default() -> Self {
-        RestartPolicy { Name: "".into(), MaximumRetryCount: 0 }
+        RestartPolicy {
+            Name: "".into(),
+            MaximumRetryCount: 0,
+        }
     }
 }
 
@@ -272,9 +275,17 @@ pub struct NetworkingConfig {
 pub struct EndpointSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub IPAMConfig: Option<EndpointIpamConfig>,
-    #[serde(default, deserialize_with = "crate::de::null_to_vec", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "crate::de::null_to_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub Links: Vec<String>,
-    #[serde(default, deserialize_with = "crate::de::null_to_vec", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "crate::de::null_to_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub Aliases: Vec<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub NetworkID: String,
@@ -603,4 +614,3 @@ pub struct ContainerPathStat {
     #[serde(rename = "linkTarget")]
     pub link_target: String,
 }
-

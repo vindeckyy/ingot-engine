@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::io::Write;
 
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -32,7 +32,11 @@ pub struct VerifyingWriter<W: Write> {
 
 impl<W: Write> VerifyingWriter<W> {
     pub fn new(inner: W) -> Self {
-        Self { inner, hasher: Sha256::new(), written: 0 }
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            written: 0,
+        }
     }
 
     pub fn finish(self) -> Result<(W, String, u64)> {
@@ -63,7 +67,10 @@ impl<W: Write> Write for VerifyingWriter<W> {
 pub fn chain_id(parent_chain: Option<&str>, diff_id: &str) -> String {
     match parent_chain {
         None => diff_id.to_string(),
-        Some(p) => format!("sha256:{}", sha256_hex(format!("{} {}", p, diff_id).as_bytes())),
+        Some(p) => format!(
+            "sha256:{}",
+            sha256_hex(format!("{} {}", p, diff_id).as_bytes())
+        ),
     }
 }
 
@@ -84,10 +91,7 @@ mod tests {
         let d1 = "sha256:aaaa";
         assert_eq!(chain_id(None, d1), d1);
         // Two-layer chain: sha256 of "sha256:aaaa sha256:bbbb"
-        let expected = format!(
-            "sha256:{}",
-            sha256_hex(b"sha256:aaaa sha256:bbbb")
-        );
+        let expected = format!("sha256:{}", sha256_hex(b"sha256:aaaa sha256:bbbb"));
         assert_eq!(chain_id(Some(d1), "sha256:bbbb"), expected);
     }
 

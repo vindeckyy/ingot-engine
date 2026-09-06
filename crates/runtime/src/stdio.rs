@@ -4,7 +4,6 @@
 use bytes::Bytes;
 use serde_json::json;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc};
 
 /// Stream tag for multiplexed frames.
@@ -27,7 +26,11 @@ impl StdioHub {
     pub fn new(log_path: std::path::PathBuf) -> (Self, mpsc::Receiver<Vec<u8>>) {
         let (tx, _) = broadcast::channel(1024);
         let (stdin_tx, stdin_rx) = mpsc::channel(256);
-        let hub = StdioHub { log_path, tx, stdin_tx };
+        let hub = StdioHub {
+            log_path,
+            tx,
+            stdin_tx,
+        };
         (hub, stdin_rx)
     }
 
@@ -54,7 +57,11 @@ impl StdioHub {
 
 pub fn append_log(log_path: &std::path::Path, stream: u8, data: &[u8]) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
         let line = json!({
             "log": String::from_utf8_lossy(data),
             "stream": if stream == STREAM_STDERR { "stderr" } else { "stdout" },
@@ -65,11 +72,7 @@ pub fn append_log(log_path: &std::path::Path, stream: u8, data: &[u8]) {
 }
 
 /// Async pump (pty master) → hub.
-pub async fn pump_pipe(
-    mut pipe: tokio::net::UnixStream,
-    stream: u8,
-    hub: StdioHub,
-) {
+pub async fn pump_pipe(mut pipe: tokio::net::UnixStream, stream: u8, hub: StdioHub) {
     use tokio::io::AsyncReadExt;
     let mut buf = vec![0u8; 8192];
     loop {
@@ -102,6 +105,20 @@ pub fn pump_stdin_blocking(mut rx: mpsc::Receiver<Vec<u8>>, mut pipe: std::fs::F
             break;
         }
     }
+}
+
+/// Real os pipe (O_CLOEXEC): returns (read_fd, write_fd).
+/// Single shared definition (was triplicated across exec/step/manager).
+pub(crate) fn os_pipe_pair() -> anyhow::Result<(i32, i32)> {
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!(
+            "pipe2: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok((fds[0], fds[1]))
 }
 
 /// Encode a docker multiplexed stream frame (8-byte header).

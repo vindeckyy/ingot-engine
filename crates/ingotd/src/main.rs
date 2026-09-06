@@ -24,17 +24,23 @@ struct Args {
     /// Default bridge interface name.
     #[arg(long, default_value = "ingot0")]
     bridge: String,
+    /// Verify image-store consistency (read-only) and exit.
+    #[arg(long)]
+    fsck: bool,
+    /// Verify and repair the image store (removes stale partial downloads
+    /// and unreferenced blobs; refuses while the daemon is live), then exit.
+    #[arg(long)]
+    repair: bool,
 }
 
 fn init_logging(debug: bool) {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            if debug {
-                "debug".into()
-            } else {
-                "info,hyper=warn,reqwest=warn".into()
-            }
-        });
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if debug {
+            "debug".into()
+        } else {
+            "info,hyper=warn,reqwest=warn".into()
+        }
+    });
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
@@ -55,7 +61,23 @@ async fn main() -> Result<()> {
     }
 
     let paths = DataPaths::new(&args.data_root, &args.run_root);
+    if args.fsck || args.repair {
+        let report = if args.repair {
+            ingot_image::fsck::repair(&paths, &args.run_root)?
+        } else {
+            ingot_image::fsck::check(&paths)?
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if report.clean() {
+            println!("fsck: store is clean");
+            return Ok(());
+        }
+        anyhow::bail!("fsck: {} problem(s) found", report.errors.len());
+    }
     paths.create_all().context("initialise data root")?;
+    paths
+        .check_schema_version()
+        .context("data-root schema check")?;
 
     let config = DaemonConfig {
         debug: args.debug,
@@ -85,6 +107,7 @@ async fn main() -> Result<()> {
 
     // Crash recovery: any container recorded as running died with the daemon.
     reconcile(&paths, &containers).await;
+    audit_boot_leaks(&paths);
 
     daemon.containers = Some(containers);
     let state = Arc::new(daemon);
@@ -99,12 +122,16 @@ async fn main() -> Result<()> {
     ingot_server::serve::serve(state, &args.socket).await
 }
 
-/// On boot, mark stale "running" containers as exited and clean their mounts.
+/// On boot: stale "running" containers died with the daemon. Supervised
+/// policies (`always`, `unless-stopped`) are restarted (Plan Phase 2, unit
+/// 2.3); everything else is marked exited and cleaned up.
 async fn reconcile(paths: &DataPaths, containers: &Arc<ingot_runtime::ContainerManager>) {
     {
         for record in containers.list_records().await {
             let state_path = paths.container_state(&record.id);
-            let Ok(raw) = std::fs::read(&state_path) else { continue };
+            let Ok(raw) = std::fs::read(&state_path) else {
+                continue;
+            };
             let Ok(mut st) = serde_json::from_slice::<ingot_runtime::record::ContainerState>(&raw)
             else {
                 continue;
@@ -112,13 +139,116 @@ async fn reconcile(paths: &DataPaths, containers: &Arc<ingot_runtime::ContainerM
             if st.status == ingot_runtime::record::StateStatus::Running
                 || st.status == ingot_runtime::record::StateStatus::Paused
             {
-                tracing::warn!("reconcile: container {} was running at boot — marking exited", &record.id[..12.min(record.id.len())]);
+                let short = &record.id[..12.min(record.id.len())];
+                // Persisted restart intent survives the daemon (unless-stopped
+                // means "keep running across reboots until explicitly stopped").
+                let policy = record.hostconfig.RestartPolicy.Name.as_str();
+                if matches!(policy, "always" | "unless-stopped") {
+                    tracing::warn!(
+                        "reconcile: restarting supervised container {short} (policy {policy})"
+                    );
+                    st.status = ingot_runtime::record::StateStatus::Exited;
+                    st.exit_code = 255;
+                    st.finished_at = ingot_util::now_rfc3339();
+                    st.pid = 0;
+                    let _ = ingot_store::write_json_atomic(&state_path, &st);
+                    let _ = ingot_runtime::manager::cleanup_runtime_state(paths, &record.id);
+                    if let Err(e) = containers.start(&record.id).await {
+                        tracing::warn!("reconcile: restart of {short} failed: {e:#}");
+                    }
+                    continue;
+                }
+                tracing::warn!("reconcile: container {short} was running at boot — marking exited");
                 st.status = ingot_runtime::record::StateStatus::Exited;
                 st.exit_code = 255;
                 st.finished_at = ingot_util::now_rfc3339();
                 st.pid = 0;
                 let _ = ingot_store::write_json_atomic(&state_path, &st);
-                let _ = ingot_runtime::manager::cleanup_container(paths, &record.id);
+                // Runtime state only: the record stays so the container
+                // shows up Exited (docker semantics across restarts).
+                let _ = ingot_runtime::manager::cleanup_runtime_state(paths, &record.id);
+            }
+        }
+    }
+}
+
+/// Boot-leak audit (Plan Phase 2, unit 2.7): after reconcile, no live
+/// container exists, so any overlay mount under our overlay root or any
+/// leftover `ingot.slice/<id>` cgroup is stale. Detach-unmount stale
+/// mounts, drop empty stale cgroups, and warn with counts.
+fn audit_boot_leaks(paths: &DataPaths) {
+    let overlay_root = paths.overlay();
+    let mut stale_mounts = 0;
+    let mut unmounted = 0;
+    if let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") {
+        for line in mountinfo.lines() {
+            // mount point is field 5 (after " - " separator accounting:
+            // fields are id parent maj:min root mountpoint opts...).
+            let pre = line.split(" - ").next().unwrap_or("");
+            let mountpoint = pre.split_whitespace().nth(4).unwrap_or("");
+            if !mountpoint.is_empty() && std::path::Path::new(mountpoint).starts_with(&overlay_root)
+            {
+                stale_mounts += 1;
+                let cpoint = std::ffi::CString::new(mountpoint.as_bytes().to_vec()).unwrap();
+                let rc = unsafe { libc::umount2(cpoint.as_ptr(), libc::MNT_DETACH) };
+                if rc == 0 {
+                    unmounted += 1;
+                }
+            }
+        }
+    }
+    if stale_mounts > 0 {
+        tracing::warn!(
+            "boot audit: found {stale_mounts} stale overlay mount(s), detached {unmounted}"
+        );
+    }
+    let slice = std::path::Path::new("/sys/fs/cgroup/ingot.slice");
+    let mut stale_cgroups = 0;
+    if let Ok(rd) = std::fs::read_dir(slice) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stale_cgroups += 1;
+                // Succeeds only when the cgroup is drained; anything live
+                // is left alone and reported.
+                let _ = std::fs::remove_dir(&p);
+            }
+        }
+    }
+    if stale_cgroups > 0 {
+        let remaining = std::fs::read_dir(slice).map(|r| r.count()).unwrap_or(0);
+        tracing::warn!("boot audit: found {stale_cgroups} stale cgroup(s), {remaining} remaining");
+    }
+    sweep_builder_scratch(paths);
+}
+
+/// Boot sweep for builder scratch: a SIGTERM/SIGKILL mid-build (or a
+/// step failure before cleanup) strands `builder/steps/<id>` work roots
+/// — which may hold bind-mounted secret files — and `build_contexts`
+/// uploads. No live build exists at boot, so detach any mounts beneath
+/// each entry and remove it. Best-effort: failures only warn.
+fn sweep_builder_scratch(paths: &DataPaths) {
+    for root in [paths.builder().join("steps"), paths.build_contexts()] {
+        let Ok(rd) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") {
+                for line in mountinfo.lines() {
+                    let pre = line.split(" - ").next().unwrap_or("");
+                    let mountpoint = pre.split_whitespace().nth(4).unwrap_or("");
+                    if !mountpoint.is_empty() && std::path::Path::new(mountpoint).starts_with(&p) {
+                        let cpoint =
+                            std::ffi::CString::new(mountpoint.as_bytes().to_vec()).unwrap();
+                        unsafe {
+                            libc::umount2(cpoint.as_ptr(), libc::MNT_DETACH);
+                        }
+                    }
+                }
+            }
+            if std::fs::remove_dir_all(&p).is_ok() {
+                tracing::warn!("boot audit: removed stale builder scratch {}", p.display());
             }
         }
     }
@@ -165,10 +295,9 @@ fn try_overlay_mount(tmp: &std::path::Path) -> bool {
     let mount_overlay = |data: &str| unsafe {
         let null = std::ffi::CString::new("").unwrap();
         let fs = std::ffi::CString::new("overlay").unwrap();
-        let dir = std::ffi::CString::new(
-            tmp.join("merged").as_os_str().as_encoded_bytes().to_vec(),
-        )
-        .unwrap();
+        let dir =
+            std::ffi::CString::new(tmp.join("merged").as_os_str().as_encoded_bytes().to_vec())
+                .unwrap();
         let data = std::ffi::CString::new(data).unwrap();
         libc::mount(
             null.as_ptr(),
@@ -182,6 +311,8 @@ fn try_overlay_mount(tmp: &std::path::Path) -> bool {
         return true;
     }
     // Try to autoload the module, retry once.
-    let _ = std::process::Command::new("modprobe").arg("overlay").status();
+    let _ = std::process::Command::new("modprobe")
+        .arg("overlay")
+        .status();
     mount_overlay(&opts) == 0
 }

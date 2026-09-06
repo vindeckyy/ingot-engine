@@ -18,6 +18,11 @@ pub struct ContainerRecord {
     pub cmd_display: String,
     /// Network endpoints allocated at create time: network → endpoint.
     pub endpoints: Vec<EndpointRecord>,
+    /// Set once a start has wired (or deliberately skipped) networking.
+    /// Distinguishes "never started" (wire the default network) from
+    /// "disconnected down to zero" (stay offline — a disconnect is
+    /// permanent until a live connect re-adds an endpoint).
+    pub wired_once: bool,
     /// Volume/bind mounts resolved at create time.
     pub mounts: Vec<MountRecord>,
 }
@@ -31,6 +36,10 @@ pub struct EndpointRecord {
     pub gateway: String,
     pub mac: String,
     pub aliases: Vec<String>,
+    /// Create-time static IP request (NetworkingConfig IPAMConfig),
+    /// consumed at first wire; retained afterwards for inspectability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -59,9 +68,10 @@ pub struct ContainerState {
     pub health: Option<ingot_api::HealthState>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum StateStatus {
     #[serde(rename = "created")]
+    #[default]
     Created,
     #[serde(rename = "running")]
     Running,
@@ -75,12 +85,6 @@ pub enum StateStatus {
     Exited,
     #[serde(rename = "dead")]
     Dead,
-}
-
-impl Default for StateStatus {
-    fn default() -> Self {
-        StateStatus::Created
-    }
 }
 
 impl StateStatus {

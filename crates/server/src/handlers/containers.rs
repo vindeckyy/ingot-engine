@@ -7,6 +7,8 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use base64::Engine;
+use futures::StreamExt;
 use ingot_api::{
     ContainerConfig, ContainerCreateBody, ContainerInspect, ContainerPathStat, ContainerState,
     ContainerSummary, ContainersPruneReport, EndpointSettings, GraphDriverData, MountPoint,
@@ -16,12 +18,10 @@ use ingot_api::{
 use ingot_runtime::overlay;
 use ingot_runtime::record::StateStatus;
 use ingot_store::paths::DataPaths;
-use tokio::sync::broadcast;
 use serde_json::json;
-use futures::StreamExt;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
-use base64::Engine;
+use tokio::sync::broadcast;
 
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
@@ -42,7 +42,13 @@ pub async fn create(
     let req: ContainerCreateBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
         Err(e) => {
-            tracing::debug!("create body rejected: {e}; body={}...", String::from_utf8_lossy(&body).chars().take(2000).collect::<String>());
+            tracing::debug!(
+                "create body rejected: {e}; body={}...",
+                String::from_utf8_lossy(&body)
+                    .chars()
+                    .take(2000)
+                    .collect::<String>()
+            );
             return bad_request(format!("invalid container config: {e}"));
         }
     };
@@ -57,13 +63,36 @@ pub async fn create(
     match mgr.create(&image_name, req, q.name).await {
         Ok(handle) => {
             let id = handle.id();
-            (StatusCode::CREATED, axum::Json(json!({
-                "Id": id,
-                "Warnings": [],
-            })))
+            (
+                StatusCode::CREATED,
+                axum::Json(json!({
+                    "Id": id,
+                    "Warnings": [],
+                })),
+            )
                 .into_response()
         }
-        Err(e) => crate::handlers::docker_error(StatusCode::CONFLICT, format!("{e:#}")),
+        // Typed mapping per the error taxonomy (Plan Phase 0, unit 0.2):
+        // validation/rejected options are 400, unknown names/ids 404,
+        // name conflicts 409, unexpected failures 500.
+        Err(e) => match e {
+            ingot_runtime::error::CreateError::Conflict(name) => crate::handlers::conflict(
+                format!("Conflict. The container name \"/{name}\" is already in use"),
+            ),
+            ingot_runtime::error::CreateError::NotFound(msg) => {
+                crate::handlers::not_found(format!("{msg:#}"))
+            }
+            ingot_runtime::error::CreateError::BadRequest(msg)
+            | ingot_runtime::error::CreateError::Unsupported(msg) => {
+                crate::handlers::bad_request(format!("{msg:#}"))
+            }
+            ingot_runtime::error::CreateError::Internal(e) => {
+                crate::handlers::server_error(format!("{e:#}"))
+            }
+            ingot_runtime::error::CreateError::Io(e) => {
+                crate::handlers::server_error(format!("{e:#}"))
+            }
+        },
     }
 }
 
@@ -99,8 +128,20 @@ pub async fn stop(
     Query(q): Query<StopQuery>,
 ) -> Response {
     let mgr = state.containers.as_ref().unwrap();
-    let t = q.timeout.unwrap_or(10);
-    match mgr.stop(&id, t).await {
+    if let Some(t) = q.timeout {
+        if t < 0 {
+            return bad_request("stop timeout must not be negative");
+        }
+    }
+    // `?signal=` overrides the container's StopSignal for this stop.
+    let signal = match q.signal.as_deref() {
+        None => None,
+        Some(s) => match ingot_runtime::error::parse_signal(s) {
+            Ok(n) => Some(n),
+            Err(e) => return bad_request(format!("invalid stop signal: {e}")),
+        },
+    };
+    match mgr.stop(&id, q.timeout, signal).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => not_found_or(format!("{e:#}")),
     }
@@ -119,27 +160,27 @@ pub async fn kill(
     Query(q): Query<KillQuery>,
 ) -> Response {
     let mgr = state.containers.as_ref().unwrap();
+    // Strict parsing (unit 2.2): unknown signals are 400, never silent
+    // SIGTERM. No signal defaults to SIGKILL, matching docker.
     let sig = match q.signal.as_deref() {
-        None => libc::SIGTERM,
-        Some(s) => {
-            let s = s.trim_start_matches("SIG").to_uppercase();
-            match s.as_str() {
-                "HUP" => libc::SIGHUP,
-                "INT" => libc::SIGINT,
-                "QUIT" => libc::SIGQUIT,
-                "KILL" => libc::SIGKILL,
-                "USR1" => libc::SIGUSR1,
-                "USR2" => libc::SIGUSR2,
-                "TERM" => libc::SIGTERM,
-                "CONT" => libc::SIGCONT,
-                "STOP" => libc::SIGSTOP,
-                _ => s.parse::<i32>().unwrap_or(libc::SIGTERM),
-            }
-        }
+        None => libc::SIGKILL,
+        Some(s) => match ingot_runtime::error::parse_signal(s) {
+            Ok(n) => n,
+            Err(e) => return bad_request(format!("invalid signal: {e}")),
+        },
     };
     match mgr.kill(&id, sig).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => not_found_or(format!("{e:#}")),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if msg.contains("No such container") {
+                crate::handlers::not_found(msg)
+            } else if msg.contains("not running") {
+                crate::handlers::conflict(msg)
+            } else {
+                crate::handlers::server_error(msg)
+            }
+        }
     }
 }
 
@@ -162,12 +203,80 @@ pub async fn wait(
     };
     if !handle.is_running() {
         let code = handle.state.lock().unwrap().exit_code;
-        return axum::Json(WaitResponse { StatusCode: code, Error: None }).into_response();
+        return axum::Json(WaitResponse {
+            StatusCode: code,
+            Error: None,
+        })
+        .into_response();
     }
     let mut rx = handle.subscribe_exit();
     match rx.recv().await {
-        Ok(code) => axum::Json(WaitResponse { StatusCode: code, Error: None }).into_response(),
+        Ok(code) => axum::Json(WaitResponse {
+            StatusCode: code,
+            Error: None,
+        })
+        .into_response(),
         Err(e) => server_error(format!("wait: {e}")),
+    }
+}
+
+/// `GET /containers/json` filter set (Plan Phase 1, unit 1.2).
+/// Unknown filter keys are an explicit 400, never a silent ignore.
+#[derive(Debug, Default)]
+struct ListFilters {
+    status: Vec<String>,
+    name: Vec<String>,
+    label: Vec<String>,
+    ancestor: Vec<String>,
+    network: Vec<String>,
+    volume: Vec<String>,
+}
+
+// `Response` is large by nature; this is a cold error path, not a hot loop.
+#[allow(clippy::result_large_err)]
+fn parse_list_filters(raw: Option<&str>) -> Result<ListFilters, Response> {
+    let mut f = ListFilters::default();
+    let Some(raw) = raw else { return Ok(f) };
+    if raw.trim().is_empty() {
+        return Ok(f);
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| bad_request(format!("invalid filters: {e}")))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| bad_request("invalid filters: expected a JSON object"))?;
+    for (k, vals) in obj {
+        let vals: Vec<String> = vals
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        match k.as_str() {
+            "status" => f.status = vals,
+            "name" => f.name = vals,
+            "label" => f.label = vals,
+            "ancestor" => f.ancestor = vals,
+            "network" => f.network = vals,
+            "volume" => f.volume = vals,
+            // Explicitly unsupported (documented): id, before/since,
+            // exited, health, isolation, is-task.
+            other => {
+                return Err(bad_request(format!(
+                    "invalid filter '{other}' (supported: status, name, label, ancestor, network, volume)"
+                )));
+            }
+        }
+    }
+    Ok(f)
+}
+
+fn match_label(labels: &HashMap<String, String>, want: &str) -> bool {
+    match want.split_once('=') {
+        Some((k, v)) => labels.get(k).is_some_and(|got| got == v),
+        None => labels.contains_key(want),
     }
 }
 
@@ -175,13 +284,18 @@ pub async fn wait(
 pub async fn list(State(state): State<SharedState>, Query(q): Query<ListQuery>) -> Response {
     let mgr = state.containers.as_ref().unwrap();
     let all = q.all.unwrap_or(false);
+    let filters = match parse_list_filters(q.filters.as_deref()) {
+        Ok(f) => f,
+        Err(resp) => return resp,
+    };
     let mut out: Vec<ContainerSummary> = Vec::new();
     for record in mgr.list_records().await {
-        let st: ingot_runtime::record::ContainerState = if let Ok(Some(h)) = mgr.get(&record.id).await {
-            h.state.lock().unwrap().clone()
-        } else {
-            ingot_store::read_json(&state.paths.container_state(&record.id)).unwrap_or_default()
-        };
+        let st: ingot_runtime::record::ContainerState =
+            if let Ok(Some(h)) = mgr.get(&record.id).await {
+                h.state.lock().unwrap().clone()
+            } else {
+                ingot_store::read_json(&state.paths.container_state(&record.id)).unwrap_or_default()
+            };
         let running = st.status == StateStatus::Running;
         if !all && !running && q.limit.is_none() {
             continue;
@@ -205,20 +319,97 @@ pub async fn list(State(state): State<SharedState>, Query(q): Query<ListQuery>) 
             StateStatus::Paused => "Up (Paused)".to_string(),
             other => other.as_str().to_string(),
         };
-        let ports: Vec<Port> = record
+        // Filters (unit 1.2): every key is AND, values within a key are OR.
+        if !filters.status.is_empty() && !filters.status.iter().any(|s| s == st.status.as_str()) {
+            continue;
+        }
+        if !filters.name.is_empty() && !filters.name.iter().any(|n| record.name.contains(n)) {
+            continue;
+        }
+        if !filters.label.is_empty()
+            && !filters
+                .label
+                .iter()
+                .any(|l| match_label(&record.config.Labels, l))
+        {
+            continue;
+        }
+        if !filters.ancestor.is_empty()
+            && !filters.ancestor.iter().any(|a| {
+                record.image_name == *a
+                    || record.image_id == *a
+                    || record.image_id.strip_prefix("sha256:").unwrap_or("") == a
+            })
+        {
+            continue;
+        }
+        if !filters.network.is_empty()
+            && !filters.network.iter().any(|n| {
+                record
+                    .endpoints
+                    .iter()
+                    .any(|e| e.network_name == *n || e.network_id == *n)
+            })
+        {
+            continue;
+        }
+        if !filters.volume.is_empty()
+            && !filters
+                .volume
+                .iter()
+                .any(|v| record.mounts.iter().any(|m| m.source == *v || m.name == *v))
+        {
+            continue;
+        }
+        let mut ports: Vec<Port> = record
             .hostconfig
             .PortBindings
             .iter()
             .flat_map(|(k, v)| {
                 let (private, typ) = parse_port_key(k);
                 v.iter().map(move |b| Port {
-                    IP: if b.HostIp.is_empty() { "0.0.0.0".to_string() } else { b.HostIp.clone() },
+                    IP: if b.HostIp.is_empty() {
+                        "0.0.0.0".to_string()
+                    } else {
+                        b.HostIp.clone()
+                    },
                     PrivatePort: private,
                     PublicPort: b.HostPort.parse().ok(),
                     Type: typ.clone(),
                 })
             })
             .collect();
+        // Overlay live rules for ephemeral/`-P` mappings (see inspect).
+        if let Some(netmgr) = state.networks.as_ref() {
+            for r in netmgr.published_for(&record.id).await {
+                let ip = if r.host_ip.is_empty() {
+                    "0.0.0.0".to_string()
+                } else {
+                    r.host_ip.clone()
+                };
+                let known = ports.iter().any(|p| {
+                    p.PrivatePort == r.container_port
+                        && p.Type == r.proto
+                        && p.PublicPort == Some(r.host_port)
+                });
+                if known {
+                    continue;
+                }
+                if let Some(slot) = ports.iter_mut().find(|p| {
+                    p.PrivatePort == r.container_port && p.Type == r.proto && p.PublicPort.is_none()
+                }) {
+                    slot.PublicPort = Some(r.host_port);
+                    slot.IP = ip;
+                } else {
+                    ports.push(Port {
+                        IP: ip,
+                        PrivatePort: r.container_port,
+                        PublicPort: Some(r.host_port),
+                        Type: r.proto.clone(),
+                    });
+                }
+            }
+        }
         let networks = record
             .endpoints
             .iter()
@@ -228,6 +419,8 @@ pub async fn list(State(state): State<SharedState>, Query(q): Query<ListQuery>) 
                     EndpointSettings {
                         IPAddress: e.ip.clone(),
                         Gateway: e.gateway.clone(),
+                        NetworkID: e.network_id.clone(),
+                        Aliases: e.aliases.clone(),
                         ..Default::default()
                     },
                 )
@@ -246,9 +439,34 @@ pub async fn list(State(state): State<SharedState>, Query(q): Query<ListQuery>) 
             Labels: record.config.Labels.clone(),
             State: st.status.as_str().into(),
             Status: status,
-            HostConfig: Some(SummaryHostConfig { NetworkMode: record.hostconfig.NetworkMode.clone() }),
+            HostConfig: Some(SummaryHostConfig {
+                NetworkMode: record.hostconfig.NetworkMode.clone(),
+            }),
             NetworkSettings: Some(SummaryNetworkSettings { Networks: networks }),
-            Mounts: Some(vec![]),
+            Mounts: Some(
+                record
+                    .mounts
+                    .iter()
+                    .map(|m| MountPoint {
+                        typ: m.typ.clone(),
+                        Name: m.name.clone(),
+                        Source: m.source.clone(),
+                        Destination: m.destination.clone(),
+                        Driver: if m.typ == "volume" {
+                            "local".into()
+                        } else {
+                            String::new()
+                        },
+                        Mode: if m.read_only {
+                            "ro".into()
+                        } else {
+                            "rw".into()
+                        },
+                        RW: !m.read_only,
+                        Propagation: String::new(),
+                    })
+                    .collect(),
+            ),
         });
     }
     if let Some(l) = q.limit {
@@ -263,6 +481,9 @@ pub struct ListQuery {
     #[serde(deserialize_with = "ingot_api::de::flexible_bool", default)]
     all: Option<bool>,
     limit: Option<i64>,
+    // Accepted for API compatibility; per-container size accounting lands
+    // in Plan Phase 1 (unit 1.2, with /system/df).
+    #[allow(dead_code)]
     #[serde(deserialize_with = "ingot_api::de::flexible_bool", default)]
     size: Option<bool>,
     filters: Option<String>,
@@ -272,6 +493,44 @@ fn parse_port_key(k: &str) -> (u16, String) {
     match k.split_once('/') {
         Some((p, t)) => (p.parse().unwrap_or(0), t.to_string()),
         None => (k.parse().unwrap_or(0), "tcp".to_string()),
+    }
+}
+
+/// Overlay live published rules onto request-based port rendering:
+/// ephemeral/auto-assigned host ports and `-P` expansions exist only in
+/// the network manager's published set. Explicit bindings already carry
+/// their host port and are left untouched.
+async fn overlay_published_ports(
+    state: &SharedState,
+    container_id: &str,
+    ports: &mut HashMap<String, Option<Vec<PortMapping>>>,
+) {
+    let Some(netmgr) = state.networks.as_ref() else {
+        return;
+    };
+    for r in netmgr.published_for(container_id).await {
+        let key = format!("{}/{}", r.container_port, r.proto);
+        let mapping = PortMapping {
+            HostIp: r.host_ip.clone(),
+            HostPort: r.host_port.to_string(),
+        };
+        match ports.get_mut(&key) {
+            Some(Some(v)) => {
+                if v.iter()
+                    .any(|m| m.HostIp == mapping.HostIp && m.HostPort == mapping.HostPort)
+                {
+                    continue;
+                }
+                if let Some(slot) = v.iter_mut().find(|m| m.HostPort.is_empty()) {
+                    *slot = mapping;
+                } else {
+                    v.push(mapping);
+                }
+            }
+            _ => {
+                ports.insert(key, Some(vec![mapping]));
+            }
+        }
     }
 }
 
@@ -311,8 +570,16 @@ pub async fn inspect(State(state): State<SharedState>, Path(id): Path<String>) -
             Name: m.name.clone(),
             Source: m.source.clone(),
             Destination: m.destination.clone(),
-            Driver: if m.typ == "volume" { "local".into() } else { String::new() },
-            Mode: if m.read_only { "ro".into() } else { "rw".into() },
+            Driver: if m.typ == "volume" {
+                "local".into()
+            } else {
+                String::new()
+            },
+            Mode: if m.read_only {
+                "ro".into()
+            } else {
+                "rw".into()
+            },
             RW: !m.read_only,
             Propagation: "rprivate".into(),
         })
@@ -323,12 +590,19 @@ pub async fn inspect(State(state): State<SharedState>, Path(id): Path<String>) -
     for (k, v) in &record.hostconfig.PortBindings {
         ports.insert(
             k.clone(),
-            Some(v.iter().map(|b| PortMapping {
-                HostIp: b.HostIp.clone(),
-                HostPort: b.HostPort.clone(),
-            }).collect()),
+            Some(
+                v.iter()
+                    .map(|b| PortMapping {
+                        HostIp: b.HostIp.clone(),
+                        HostPort: b.HostPort.clone(),
+                    })
+                    .collect(),
+            ),
         );
     }
+    // Overlay live published rules: ephemeral/auto-assigned host ports
+    // and `-P` expansions exist only in the network manager.
+    overlay_published_ports(&state, &record.id, &mut ports).await;
 
     let argv = record.argv();
     let networks = record
@@ -340,6 +614,8 @@ pub async fn inspect(State(state): State<SharedState>, Path(id): Path<String>) -
                 EndpointSettings {
                     IPAddress: e.ip.clone(),
                     Gateway: e.gateway.clone(),
+                    NetworkID: e.network_id.clone(),
+                    Aliases: e.aliases.clone(),
                     ..Default::default()
                 },
             )
@@ -366,9 +642,21 @@ pub async fn inspect(State(state): State<SharedState>, Path(id): Path<String>) -
             Health: st.health.clone(),
         },
         Image: record.image_id.clone(),
-        ResolvConfPath: state.paths.container_resolv(&record.id).display().to_string(),
-        HostnamePath: state.paths.container_hostname(&record.id).display().to_string(),
-        HostsPath: state.paths.container_hosts(&record.id).display().to_string(),
+        ResolvConfPath: state
+            .paths
+            .container_resolv(&record.id)
+            .display()
+            .to_string(),
+        HostnamePath: state
+            .paths
+            .container_hostname(&record.id)
+            .display()
+            .to_string(),
+        HostsPath: state
+            .paths
+            .container_hosts(&record.id)
+            .display()
+            .to_string(),
         LogPath: state.paths.container_log(&record.id).display().to_string(),
         Name: format!("/{}", record.name),
         RestartCount: st.restart_count,
@@ -379,7 +667,10 @@ pub async fn inspect(State(state): State<SharedState>, Path(id): Path<String>) -
         AppArmorProfile: String::new(),
         ExecIDs: None,
         HostConfig: record.hostconfig.clone(),
-        GraphDriver: GraphDriverData { Name: "overlay2".into(), Data: HashMap::new() },
+        GraphDriver: GraphDriverData {
+            Name: "overlay2".into(),
+            Data: HashMap::new(),
+        },
         Mounts: mounts,
         Config: ContainerConfig {
             Hostname: record.config.Hostname.clone(),
@@ -388,9 +679,17 @@ pub async fn inspect(State(state): State<SharedState>, Path(id): Path<String>) -
         },
         NetworkSettings: NetworkSettingsInspect {
             Ports: ports,
-            IPAddress: record.endpoints.first().map(|e| e.ip.clone()).unwrap_or_default(),
+            IPAddress: record
+                .endpoints
+                .first()
+                .map(|e| e.ip.clone())
+                .unwrap_or_default(),
             IPPrefixLen: 16,
-            Gateway: record.endpoints.first().map(|e| e.gateway.clone()).unwrap_or_default(),
+            Gateway: record
+                .endpoints
+                .first()
+                .map(|e| e.gateway.clone())
+                .unwrap_or_default(),
             Bridge: state.config.default_bridge_name.clone(),
             SandboxKey: format!("/var/run/netns/{}", record.id),
             Networks: networks,
@@ -406,8 +705,14 @@ pub async fn inspect(State(state): State<SharedState>, Path(id): Path<String>) -
 pub struct RemoveQuery {
     #[serde(deserialize_with = "ingot_api::de::flexible_bool", default)]
     force: Option<bool>,
+    // Accepted for API compatibility; anonymous-volume removal on rm lands
+    // in Plan Phase 7 (unit 7.3).
+    #[allow(dead_code)]
     #[serde(deserialize_with = "ingot_api::de::flexible_bool", default)]
     v: Option<bool>,
+    // Accepted for API compatibility; legacy links are unsupported and
+    // ignored (documented in Plan Phase 1).
+    #[allow(dead_code)]
     link: Option<bool>,
 }
 
@@ -424,11 +729,24 @@ pub async fn remove(
 }
 
 /// POST /containers/{id}/pause | /unpause
+fn pause_state_error(msg: String) -> Response {
+    if msg.contains("No such container") {
+        not_found(msg)
+    } else if msg.contains("already paused")
+        || msg.contains("not running")
+        || msg.contains("not paused")
+    {
+        crate::handlers::conflict(msg)
+    } else {
+        server_error(msg)
+    }
+}
+
 pub async fn pause(State(state): State<SharedState>, Path(id): Path<String>) -> Response {
     let mgr = state.containers.as_ref().unwrap();
     match mgr.pause(&id, true).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => not_found_or(format!("{e:#}")),
+        Err(e) => pause_state_error(format!("{e:#}")),
     }
 }
 
@@ -436,7 +754,7 @@ pub async fn unpause(State(state): State<SharedState>, Path(id): Path<String>) -
     let mgr = state.containers.as_ref().unwrap();
     match mgr.pause(&id, false).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => not_found_or(format!("{e:#}")),
+        Err(e) => pause_state_error(format!("{e:#}")),
     }
 }
 
@@ -475,13 +793,27 @@ pub async fn logs(
     let tail_n: usize = if tail_all {
         usize::MAX
     } else {
-        q.tail.as_deref().and_then(|t| t.parse().ok()).unwrap_or(usize::MAX)
+        q.tail
+            .as_deref()
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(usize::MAX)
     };
+    let since = q
+        .since
+        .as_deref()
+        .and_then(parse_log_time)
+        .map(|d| d.timestamp());
+    let until = q
+        .until
+        .as_deref()
+        .and_then(parse_log_time)
+        .map(|d| d.timestamp());
+    let timestamps = q.timestamps.unwrap_or(false);
 
     // Read historical lines.
     let log_path = state.paths.container_log(&record.id);
     let raw = std::fs::read(&log_path).unwrap_or_default();
-    let mut lines: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut lines: Vec<(u8, Vec<u8>, String)> = Vec::new();
     for line in raw.split(|&b| b == b'\n') {
         if line.is_empty() {
             continue;
@@ -492,11 +824,26 @@ pub async fn logs(
             } else {
                 ingot_runtime::stdio::STREAM_STDOUT
             };
-            let data = v["log"].as_str().unwrap_or("").as_bytes().to_vec();
+            let time = v["time"].as_str().unwrap_or("").to_string();
+            let ts = parse_log_time(&time).map(|d| d.timestamp()).unwrap_or(0);
+            if since.is_some_and(|s| ts < s) {
+                continue;
+            }
+            if until.is_some_and(|u| ts > u) {
+                continue;
+            }
+            let log_text = v["log"].as_str().unwrap_or("").to_string();
+            let data = if timestamps && !log_text.is_empty() {
+                let mut out = format!("{time} ").into_bytes();
+                out.extend_from_slice(log_text.as_bytes());
+                out
+            } else {
+                log_text.into_bytes()
+            };
             let keep = (stream == ingot_runtime::stdio::STREAM_STDOUT && want_out)
                 || (stream == ingot_runtime::stdio::STREAM_STDERR && want_err);
             if keep {
-                lines.push((stream, data));
+                lines.push((stream, data, time));
             }
         }
     }
@@ -506,9 +853,12 @@ pub async fn logs(
 
     let tty = record.config.Tty;
     let mut body_bytes: Vec<u8> = Vec::new();
-    for (stream, data) in &lines {
+    for (stream, data, _time) in &lines {
         if tty {
             body_bytes.extend_from_slice(data);
+            if !data.ends_with(b"\n") {
+                body_bytes.push(b'\n');
+            }
         } else {
             body_bytes.extend_from_slice(&ingot_runtime::stdio::frame(*stream, data));
         }
@@ -517,17 +867,25 @@ pub async fn logs(
     if !q.follow.unwrap_or(false) {
         return Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/vnd.docker.multiplexed-stream")
+            .header(
+                header::CONTENT_TYPE,
+                "application/vnd.docker.multiplexed-stream",
+            )
             .body(Body::from(body_bytes))
             .unwrap();
     }
 
     // Follow: initial lines + live stream.
     let rx = handle.stdio.subscribe();
-    let initial: Vec<Result<axum::body::Bytes, std::io::Error>> = vec![Ok(axum::body::Bytes::from(body_bytes))];
-    let stream = futures::stream::iter(initial)
-        .chain(futures::stream::unfold(rx, move |mut rx| async move {
+    let initial: Vec<Result<axum::body::Bytes, std::io::Error>> =
+        vec![Ok(axum::body::Bytes::from(body_bytes))];
+    let stream = futures::stream::iter(initial).chain(futures::stream::unfold(
+        (rx, until, timestamps),
+        move |(mut rx, until, timestamps)| async move {
             loop {
+                if until.is_some_and(|u| chrono::Utc::now().timestamp() > u) {
+                    return None;
+                }
                 match rx.recv().await {
                     Ok((stream, data)) => {
                         let keep = (stream == ingot_runtime::stdio::STREAM_STDOUT && want_out)
@@ -535,23 +893,45 @@ pub async fn logs(
                         if !keep {
                             continue;
                         }
+                        let data = if timestamps {
+                            let ts = ingot_util::now_rfc3339();
+                            let mut out = format!("{ts} ").into_bytes();
+                            out.extend_from_slice(&data);
+                            out
+                        } else {
+                            data
+                        };
                         let frame = if tty {
-                            axum::body::Bytes::from(data)
+                            let mut out = data;
+                            if !out.ends_with(b"\n") {
+                                out.push(b'\n');
+                            }
+                            axum::body::Bytes::from(out)
                         } else {
                             ingot_runtime::stdio::frame(stream, &data)
                         };
-                        return Some((Ok(frame), rx));
+                        return Some((Ok(frame), (rx, until, timestamps)));
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => {
-                        return Some((Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed")), rx));
+                        return Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "closed",
+                            )),
+                            (rx, until, timestamps),
+                        ));
                     }
                 }
             }
-        }));
+        },
+    ));
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/vnd.docker.multiplexed-stream")
+        .header(
+            header::CONTENT_TYPE,
+            "application/vnd.docker.multiplexed-stream",
+        )
         .body(Body::from_stream(stream))
         .unwrap()
 }
@@ -576,7 +956,7 @@ pub async fn restart(
     };
     let record = handle.record.lock().unwrap().clone();
     if handle.is_running() {
-        if let Err(e) = mgr.stop(&record.id, q.timeout.unwrap_or(10)).await {
+        if let Err(e) = mgr.stop(&record.id, q.timeout, None).await {
             return server_error(format!("{e:#}"));
         }
     }
@@ -613,7 +993,11 @@ pub async fn top(
     };
     let st = handle.state.lock().unwrap().clone();
     if st.status != StateStatus::Running {
-        return (StatusCode::CONFLICT, axum::Json(json!({"message": format!("Container {id} is not running")}))).into_response();
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(json!({"message": format!("Container {id} is not running")})),
+        )
+            .into_response();
     }
 
     let record = handle.record.lock().unwrap().clone();
@@ -653,7 +1037,11 @@ pub async fn top(
             for line in status_str.lines() {
                 if let Some(rest) = line.strip_prefix("Uid:") {
                     if let Some(first_uid) = rest.split_whitespace().next() {
-                        uid = if first_uid == "0" { "root".into() } else { first_uid.to_string() };
+                        uid = if first_uid == "0" {
+                            "root".into()
+                        } else {
+                            first_uid.to_string()
+                        };
                     }
                 } else if let Some(rest) = line.strip_prefix("PPid:") {
                     if let Some(first_ppid) = rest.split_whitespace().next() {
@@ -690,10 +1078,7 @@ pub async fn top(
         ]);
     }
 
-    axum::Json(ContainerTopResponse {
-        titles,
-        processes,
-    }).into_response()
+    axum::Json(ContainerTopResponse { titles, processes }).into_response()
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -701,11 +1086,25 @@ pub async fn top(
 pub struct StatsQuery {
     #[serde(deserialize_with = "ingot_api::de::flexible_bool", default)]
     pub stream: Option<bool>,
-    #[serde(rename = "one-shot", deserialize_with = "ingot_api::de::flexible_bool", default)]
+    #[serde(
+        rename = "one-shot",
+        deserialize_with = "ingot_api::de::flexible_bool",
+        default
+    )]
     pub one_shot: Option<bool>,
 }
 
-fn sample_stats(id: &str, name: &str, pid: i64) -> ingot_api::ContainerStats {
+/// Parse the RFC 3339 timestamps used in json-file log records.
+fn parse_log_time(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(s).ok()
+}
+
+fn sample_stats(
+    id: &str,
+    name: &str,
+    pid: i64,
+    prev: Option<&ingot_api::ContainerStats>,
+) -> ingot_api::ContainerStats {
     let slice_dir = std::path::PathBuf::from(format!("/sys/fs/cgroup/ingot.slice/{id}"));
 
     let usage = std::fs::read_to_string(slice_dir.join("memory.current"))
@@ -719,7 +1118,11 @@ fn sample_stats(id: &str, name: &str, pid: i64) -> ingot_api::ContainerStats {
             if let Ok(mem) = std::fs::read_to_string("/proc/meminfo") {
                 for line in mem.lines() {
                     if let Some(rest) = line.strip_prefix("MemTotal:") {
-                        let kb = rest.trim().trim_end_matches(" kB").parse::<u64>().unwrap_or(0);
+                        let kb = rest
+                            .trim()
+                            .trim_end_matches(" kB")
+                            .parse::<u64>()
+                            .unwrap_or(0);
                         return kb * 1024;
                     }
                 }
@@ -800,12 +1203,15 @@ fn sample_stats(id: &str, name: &str, pid: i64) -> ingot_api::ContainerStats {
     }
 
     let now_str = ingot_util::now_rfc3339();
+    let preread = prev
+        .map(|p| p.read.clone())
+        .unwrap_or_else(|| now_str.clone());
 
     ingot_api::ContainerStats {
         id: id.to_string(),
         name: format!("/{}", name),
         read: now_str.clone(),
-        preread: now_str,
+        preread,
         pids_stats: ingot_api::PidsStats {
             current: pids_current,
             limit: 0,
@@ -828,17 +1234,21 @@ fn sample_stats(id: &str, name: &str, pid: i64) -> ingot_api::ContainerStats {
             online_cpus,
             throttling_data: Default::default(),
         },
-        precpu_stats: ingot_api::CpuStats {
-            cpu_usage: ingot_api::CpuUsage {
-                total_usage: total_usage.saturating_sub(1000),
-                percpu_usage: vec![],
-                usage_in_kernelmode: system_usec.saturating_mul(1000),
-                usage_in_usermode: user_usec.saturating_mul(1000),
-            },
-            system_cpu_usage: system_cpu_usage.saturating_sub(100_000_000),
-            online_cpus,
-            throttling_data: Default::default(),
-        },
+        precpu_stats: prev.map(|p| p.cpu_stats.clone()).unwrap_or_else(|| {
+            // First sample: pre == current so the delta (and thus CPU %)
+            // is zero, matching docker stats' first read.
+            ingot_api::CpuStats {
+                cpu_usage: ingot_api::CpuUsage {
+                    total_usage,
+                    percpu_usage: vec![],
+                    usage_in_kernelmode: system_usec.saturating_mul(1000),
+                    usage_in_usermode: user_usec.saturating_mul(1000),
+                },
+                system_cpu_usage,
+                online_cpus,
+                throttling_data: Default::default(),
+            }
+        }),
     }
 }
 
@@ -862,24 +1272,23 @@ pub async fn stats(
     let stream_mode = q.stream.unwrap_or(true) && !q.one_shot.unwrap_or(false);
 
     if !stream_mode {
-        let stats = sample_stats(&cid, &cname, pid);
+        let stats = sample_stats(&cid, &cname, pid, None);
         return axum::Json(stats).into_response();
     }
 
     let stream = futures::stream::unfold(
         (None::<ingot_api::ContainerStats>, cid, cname, pid),
         |(prev_sample, cid, cname, pid)| async move {
-            let mut cur = sample_stats(&cid, &cname, pid);
-            if let Some(prev) = &prev_sample {
-                cur.precpu_stats = prev.cpu_stats.clone();
-                cur.preread = prev.read.clone();
-            }
+            let cur = sample_stats(&cid, &cname, pid, prev_sample.as_ref());
             let next_prev = Some(cur.clone());
             let json_bytes = serde_json::to_vec(&cur).unwrap_or_default();
             let mut chunk = json_bytes;
             chunk.push(b'\n');
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)), (next_prev, cid, cname, pid)))
+            Some((
+                Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)),
+                (next_prev, cid, cname, pid),
+            ))
         },
     );
 
@@ -910,7 +1319,11 @@ pub async fn prune(State(state): State<SharedState>) -> Response {
     }
 
     let report = ContainersPruneReport {
-        ContainersDeleted: if deleted.is_empty() { None } else { Some(deleted) },
+        ContainersDeleted: if deleted.is_empty() {
+            None
+        } else {
+            Some(deleted)
+        },
         SpaceReclaimed: 0,
     };
     axum::Json(report).into_response()
@@ -1038,7 +1451,11 @@ async fn archive_handle(
 
     let meta = match std::fs::symlink_metadata(&target) {
         Ok(m) => m,
-        Err(_) => return not_found(format!("Could not find the file {path_param} in container {id}")),
+        Err(_) => {
+            return not_found(format!(
+                "Could not find the file {path_param} in container {id}"
+            ))
+        }
     };
 
     let name = std::path::Path::new(rel_path)
@@ -1046,7 +1463,11 @@ async fn archive_handle(
         .and_then(|n| n.to_str())
         .unwrap_or(rel_path)
         .to_string();
-    let name = if name.is_empty() { ".".to_string() } else { name };
+    let name = if name.is_empty() {
+        ".".to_string()
+    } else {
+        name
+    };
 
     let mode = meta.permissions().mode();
     let size = meta.len() as i64;
@@ -1085,7 +1506,12 @@ async fn archive_handle(
     if meta.is_dir() {
         let _ = tar_builder.append_dir(&name, &target);
         let mut seen_inodes = std::collections::HashMap::new();
-        if let Err(e) = tar_dir_recursive(&mut tar_builder, &target, std::path::Path::new(&name), &mut seen_inodes) {
+        if let Err(e) = tar_dir_recursive(
+            &mut tar_builder,
+            &target,
+            std::path::Path::new(&name),
+            &mut seen_inodes,
+        ) {
             return server_error(format!("Failed to archive directory: {e}"));
         }
     } else if meta.file_type().is_symlink() {
@@ -1166,16 +1592,62 @@ pub async fn archive_put(
     let target = merged.join(rel_path);
 
     if let Err(e) = std::fs::create_dir_all(&target) {
-        return server_error(format!("Failed to create target directory {}: {e}", target.display()));
+        return server_error(format!(
+            "Failed to create target directory {}: {e}",
+            target.display()
+        ));
     }
 
     let mut archive = tar::Archive::new(std::io::Cursor::new(body));
     archive.set_preserve_permissions(true);
     archive.set_preserve_mtime(true);
     if let Err(e) = archive.unpack(&target) {
-        return server_error(format!("Failed to unpack archive into {}: {e}", target.display()));
+        return server_error(format!(
+            "Failed to unpack archive into {}: {e}",
+            target.display()
+        ));
     }
 
     StatusCode::OK.into_response()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_filters_parse() {
+        let f = parse_list_filters(None).unwrap();
+        assert!(f.status.is_empty());
+        let f = parse_list_filters(Some("")).unwrap();
+        assert!(f.name.is_empty());
+        let f = parse_list_filters(Some(
+            r#"{"status":["running","exited"],"name":["web"],"label":["app=x","tier"],"ancestor":["busybox"],"network":["bridge"],"volume":["data"]}"#,
+        ))
+        .unwrap();
+        assert_eq!(f.status, vec!["running", "exited"]);
+        assert_eq!(f.name, vec!["web"]);
+        assert_eq!(f.label, vec!["app=x", "tier"]);
+        assert_eq!(f.ancestor, vec!["busybox"]);
+        assert_eq!(f.network, vec!["bridge"]);
+        assert_eq!(f.volume, vec!["data"]);
+    }
+
+    #[test]
+    fn list_filters_reject_malformed_and_unknown() {
+        assert!(parse_list_filters(Some("{nope")).is_err());
+        assert!(parse_list_filters(Some("[1,2]")).is_err());
+        assert!(parse_list_filters(Some(r#"{"id":["abc"]}"#)).is_err());
+        assert!(parse_list_filters(Some(r#"{"exited":[0]}"#)).is_err());
+    }
+
+    #[test]
+    fn label_matching() {
+        let labels: HashMap<String, String> =
+            [("app".to_string(), "x".to_string())].into_iter().collect();
+        assert!(match_label(&labels, "app"));
+        assert!(match_label(&labels, "app=x"));
+        assert!(!match_label(&labels, "app=y"));
+        assert!(!match_label(&labels, "missing"));
+    }
+}

@@ -18,8 +18,8 @@ pub fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<
     let tmp = path.with_extension("json.tmp");
     {
         let data = serde_json::to_vec_pretty(value)?;
-        let mut f = std::fs::File::create(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         f.write_all(&data)?;
         f.sync_all().ok();
     }

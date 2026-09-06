@@ -1,11 +1,11 @@
-pub mod system;
-pub mod events;
-pub mod system_stub;
-pub mod containers;
 pub mod attach_exec;
 pub mod build;
+pub mod containers;
+pub mod events;
 pub mod images;
 pub mod networks;
+pub mod secrets;
+pub mod system;
 pub mod volumes;
 
 use axum::http::StatusCode;
@@ -33,10 +33,76 @@ pub fn not_implemented(msg: impl std::fmt::Display) -> Response {
     docker_error(StatusCode::NOT_IMPLEMENTED, msg)
 }
 
+/// Error taxonomy (Plan Phase 0, unit 0.2):
+/// - 400 (`bad_request`): malformed input, invalid option values.
+/// - 404 (`not_found`): unknown container/image/network/volume name or id.
+/// - 409 (`conflict`): name already in use, in-use resource removal.
+/// - 500 (`server_error`): truly unexpected daemon-side failures only.
+/// - 501 (`not_implemented`): accepted API surface not yet implemented.
+pub fn conflict(msg: impl std::fmt::Display) -> Response {
+    docker_error(StatusCode::CONFLICT, msg)
+}
+
 /// Catch-all for unknown routes (e.g. Engine API endpoints we do not serve yet).
 pub async fn not_implemented_fallback(req: axum::http::Request<axum::body::Body>) -> Response {
     docker_error(
         StatusCode::NOT_IMPLEMENTED,
-        format!("endpoint {} is not implemented by ingot yet", req.uri().path()),
+        format!(
+            "endpoint {} is not implemented by ingot yet",
+            req.uri().path()
+        ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    async fn shape(resp: Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("error body readable");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("error body is JSON");
+        assert!(
+            v.get("message").and_then(|m| m.as_str()).is_some(),
+            "error body must carry a string `message`: {v}"
+        );
+        (status, v)
+    }
+
+    #[tokio::test]
+    async fn error_taxonomy_shapes() {
+        let (s, v) = shape(bad_request("bad")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(v["message"], "bad");
+
+        let (s, _) = shape(not_found("missing")).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+
+        let (s, v) = shape(conflict("in use")).await;
+        assert_eq!(s, StatusCode::CONFLICT);
+        assert_eq!(v["message"], "in use");
+
+        let (s, _) = shape(server_error("boom")).await;
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let (s, _) = shape(not_implemented("later")).await;
+        assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn fallback_names_the_endpoint() {
+        let req = axum::http::Request::builder()
+            .uri("/v1.44/plugins/list")
+            .body(Body::empty())
+            .unwrap();
+        let (s, v) = shape(not_implemented_fallback(req).await).await;
+        assert_eq!(s, StatusCode::NOT_IMPLEMENTED);
+        assert!(v["message"]
+            .as_str()
+            .unwrap()
+            .contains("/v1.44/plugins/list"));
+    }
 }

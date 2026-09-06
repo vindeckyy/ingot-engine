@@ -22,6 +22,9 @@ pub struct CreateParams {
     from_src: Option<String>,
     tag: Option<String>,
     platform: Option<String>,
+    // Accepted for API compatibility; commit messages on tag/import land in
+    // Plan Phase 4.
+    #[allow(dead_code)]
     #[serde(default)]
     message: Option<String>,
 }
@@ -41,10 +44,13 @@ pub async fn create(
         return bad_request("fromImage or fromSrc required");
     };
 
-    // "busybox" or "busybox:1.36" (CLI passes the tag via query too).
+    // "busybox" or "busybox:1.36" (CLI passes the tag via query too). The
+    // CLI splits digest references across the two params (`pull
+    // repo@digest` arrives as fromImage=repo + tag=sha256:…), so a
+    // digest-looking tag joins with '@', never ':'.
     let mut spec = spec;
-    if let (Some(t), false) = (&q.tag, spec.contains(':')) {
-        spec = format!("{spec}:{t}");
+    if let Some(t) = &q.tag {
+        spec = assemble_pull_spec(&spec, t);
     }
     let image_ref = match ImageRef::parse(&spec) {
         Ok(r) => r,
@@ -52,15 +58,22 @@ pub async fn create(
     };
 
     let auth = decode_auth_header(&headers);
+    let platform = match q.platform.as_deref() {
+        None | Some("") => None,
+        Some(p) => match ingot_registry::parse_platform(p) {
+            Ok(plat) => Some(plat),
+            Err(e) => return bad_request(e),
+        },
+    };
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressMessage>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<ProgressMessage>(64);
     let client = state.registry.clone();
     let store = state.images.clone();
     tokio::spawn(async move {
-        if let Err(e) = ingot_image::pull::pull(client, store, image_ref, auth, tx.clone()).await {
-            let _ = tx
-                .send(ProgressMessage::error(format!("{e:#}")))
-                .await;
+        if let Err(e) =
+            ingot_image::pull::pull(client, store, image_ref, auth, platform, tx.clone()).await
+        {
+            let _ = tx.send(ProgressMessage::error(format!("{e:#}"))).await;
         }
     });
 
@@ -78,11 +91,30 @@ pub async fn create(
         .unwrap()
 }
 
+/// Reassemble the CLI's split pull reference: fromImage carries the repo
+/// (sometimes with tag and/or digest) while the tag query carries the rest.
+/// Digest-looking pieces join with '@'; plain tags join with ':' only when
+/// the spec has no tag yet. A spec that already pins a digest is complete.
+fn assemble_pull_spec(spec: &str, tag: &str) -> String {
+    if spec.contains('@') || tag.is_empty() {
+        return spec.to_string();
+    }
+    if tag.starts_with("sha256:") {
+        return format!("{spec}@{tag}");
+    }
+    if tag.contains('@') || !spec.contains(':') {
+        return format!("{spec}:{tag}");
+    }
+    spec.to_string()
+}
+
 fn decode_auth_header(headers: &HeaderMap) -> Option<AuthConfig> {
     let raw = headers.get("X-Registry-Auth")?.to_str().ok()?;
     // The CLI sends either base64(json) or base64(base64(user:pass)).
     use base64::Engine;
-    let decoded = base64::engine::general_purpose::STANDARD.decode(raw.trim()).ok()?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw.trim())
+        .ok()?;
     if let Ok(cfg) = serde_json::from_slice::<AuthConfig>(&decoded) {
         if !cfg.username.is_empty() || !cfg.identity_token.is_empty() {
             return Some(cfg);
@@ -105,13 +137,182 @@ fn decode_auth_header(headers: &HeaderMap) -> Option<AuthConfig> {
     None
 }
 
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+pub struct ImageListQuery {
+    filters: Option<String>,
+}
+
+/// Shared filter-object parsing for image list/prune: a JSON object of
+/// key → string array. Empty/missing input matches everything.
+// `Response` is large by nature; this is a cold error path, not a hot loop.
+#[allow(clippy::result_large_err)]
+fn parse_filter_map(
+    raw: Option<&String>,
+) -> Result<serde_json::Map<String, serde_json::Value>, Response> {
+    match raw {
+        None => Ok(Default::default()),
+        Some(s) if s.trim().is_empty() => Ok(Default::default()),
+        Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(serde_json::Value::Object(m)) => Ok(m),
+            _ => Err(crate::handlers::bad_request(
+                "invalid filters: expected a JSON object",
+            )),
+        },
+    }
+}
+
+/// Image filters (units 1.3/4.4): dangling, label, reference, until.
+/// Unknown keys are an explicit 400.
+// `Response` is large by nature; this is a cold error path, not a hot loop.
+#[allow(clippy::result_large_err)]
+fn image_matches(
+    r: &ingot_image::ImageRecord,
+    filters: &serde_json::Map<String, serde_json::Value>,
+    now_unix: i64,
+) -> Result<bool, Response> {
+    for (k, vals) in filters {
+        // Docker sends `{"key":{"value":true}}`; accept that and the
+        // lenient `{"key":["value"]}` shape. Map keys set to true win;
+        // anything else yields no values (matching nothing).
+        let vals: Vec<String> = match vals {
+            serde_json::Value::Array(a) => a
+                .iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect(),
+            serde_json::Value::Object(m) => m
+                .iter()
+                .filter(|(_, v)| *v == &serde_json::Value::Bool(true))
+                .map(|(k, _)| k.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let hit = match k.as_str() {
+            "dangling" => {
+                let want = vals.iter().any(|v| v == "true" || v == "1");
+                r.repo_tags.is_empty() == want
+            }
+            "label" => vals.iter().any(|w| match w.split_once('=') {
+                Some((k, v)) => r.config.Labels.get(k).is_some_and(|got| got == v),
+                None => r.config.Labels.contains_key(w),
+            }),
+            "reference" => vals.iter().any(|pat| {
+                r.repo_tags.iter().any(|t| {
+                    t == pat
+                        || t.split_once(':').is_some_and(|(repo, _)| repo == pat)
+                        || (pat.strip_suffix('*').is_some_and(|p| t.starts_with(p)))
+                })
+            }),
+            // Prune-only: created before the cutoff. Images with unknown
+            // age (created_unix 0) never match: they cannot be aged.
+            "until" => {
+                let mut hit = false;
+                for v in &vals {
+                    let cutoff = parse_until(v, now_unix).map_err(|e| {
+                        crate::handlers::bad_request(format!("invalid until filter {v:?}: {e}"))
+                    })?;
+                    if r.created_unix > 0 && r.created_unix < cutoff {
+                        hit = true;
+                        break;
+                    }
+                }
+                hit
+            }
+            other => {
+                return Err(crate::handlers::bad_request(format!(
+                    "invalid filter '{other}' (supported: dangling, label, reference, until)"
+                )));
+            }
+        };
+        if !hit {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Parse an `until` filter value to a unix cutoff: unix timestamp,
+/// RFC 3339 timestamp, or Go-style duration (`24h`, `30m`, `90s`, `1h30m`)
+/// meaning that long ago.
+fn parse_until(v: &str, now_unix: i64) -> Result<i64, String> {
+    let v = v.trim();
+    if v.is_empty() {
+        return Err("empty value".to_string());
+    }
+    if let Ok(ts) = v.parse::<i64>() {
+        if ts >= 0 {
+            return Ok(ts);
+        }
+        return Err("negative timestamp".to_string());
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(v) {
+        return Ok(dt.timestamp());
+    }
+    parse_go_duration(v)
+        .map(|d| now_unix.saturating_sub(d))
+        .ok_or_else(|| "want a unix timestamp, RFC 3339 time, or Go duration like 24h".to_string())
+}
+
+/// Go-style duration (`1h30m`, `90s`): digits + h/m/s segments.
+fn parse_go_duration(v: &str) -> Option<i64> {
+    let mut total = 0i64;
+    let mut num = String::new();
+    let mut any = false;
+    for c in v.chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+        } else {
+            let n: i64 = num.parse().ok()?;
+            let secs = match c {
+                'h' => n.checked_mul(3600)?,
+                'm' => n.checked_mul(60)?,
+                's' => n,
+                _ => return None,
+            };
+            total = total.checked_add(secs)?;
+            num.clear();
+            any = true;
+        }
+    }
+    if !num.is_empty() || !any {
+        return None;
+    }
+    Some(total)
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// GET /images/json
-pub async fn list(State(state): State<SharedState>) -> Response {
-    let tags = state.images.all_tags().await;
+pub async fn list(State(state): State<SharedState>, Query(q): Query<ImageListQuery>) -> Response {
+    let _tags = state.images.all_tags().await;
+    let filters = match parse_filter_map(q.filters.as_ref()) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+    let now = now_unix();
     let mut out: Vec<ImageSummary> = Vec::new();
-    match state.images.list().await {
+    match state.images.list_effective().await {
         Ok(records) => {
+            // Container counts for the Containers column.
+            let mut usage: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            if let Some(mgr) = state.containers.as_ref() {
+                for rec in mgr.list_records().await {
+                    let key = rec.image_id.trim_start_matches("sha256:").to_string();
+                    *usage.entry(key).or_default() += 1;
+                }
+            }
             for r in records {
+                match image_matches(&r, &filters, now) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(resp) => return resp,
+                }
                 out.push(ImageSummary {
                     Id: format!("sha256:{}", r.id),
                     ParentId: String::new(),
@@ -122,10 +323,10 @@ pub async fn list(State(state): State<SharedState>) -> Response {
                     SharedSize: -1,
                     VirtualSize: r.size,
                     Labels: r.config.Labels.clone(),
-                    Containers: 0,
+                    Containers: usage.get(&r.id).copied().unwrap_or(0),
                 });
             }
-            out.sort_by(|a, b| b.Created.cmp(&a.Created));
+            out.sort_by_key(|b| std::cmp::Reverse(b.Created));
             axum::Json(out).into_response()
         }
         Err(e) => server_error(e),
@@ -142,9 +343,12 @@ pub async fn inspect(State(state): State<SharedState>, Path(name): Path<String>)
         Ok(Some(r)) => r,
         _ => return not_found(format!("No such image: {name}")),
     };
+    // Effective tags: inspect shows the tags that resolve here, not stale
+    // embedded copies from before the tag moved on.
+    let repo_tags = state.images.effective_tags(&record).await;
     let inspect = ImageInspect {
         Id: format!("sha256:{}", record.id),
-        RepoTags: record.repo_tags.clone(),
+        RepoTags: repo_tags,
         RepoDigests: record.repo_digests.clone(),
         Parent: String::new(),
         Comment: record.comment.clone(),
@@ -183,45 +387,53 @@ pub async fn history(State(state): State<SharedState>, Path(name): Path<String>)
         Ok(Some(r)) => r,
         _ => return not_found(format!("No such image: {name}")),
     };
-    let mut layer_sizes: Vec<i64> = vec![0; record.diff_ids.len().max(1)];
-    let items: Vec<HistoryResponseItem> = record
+    // Stored history is oldest-first (OCI config order); docker prints
+    // newest-first, so walk it reversed. Non-empty entries in stored order
+    // line up 1:1 with diff_ids/layer_blobs/chain_ids (bottom-up).
+    let layer_order: Vec<usize> = record
         .history
         .iter()
         .enumerate()
-        .map(|(i, h)| {
-            let size = if h.empty_layer == Some(true) {
-                0
-            } else {
-                // consume sizes for non-empty layers, bottom-up
-                let idx = record
-                    .history
-                    .iter()
-                    .take(i + 1)
-                    .filter(|x| x.empty_layer != Some(true))
-                    .count();
-                let s = layer_sizes.get(idx.saturating_sub(1)).copied().unwrap_or(0);
-                s
-            };
-            HistoryResponseItem {
-                Comment: h.comment.clone().unwrap_or_default(),
-                Created: chrono::DateTime::parse_from_rfc3339(&h.created)
-                    .map(|d| d.timestamp())
-                    .unwrap_or(0),
-                CreatedBy: h.created_by.clone(),
-                Id: if h.empty_layer == Some(true) {
-                    "<missing>".into()
-                } else {
-                    format!("sha256:{}", record.id)
-                },
-                Size: size,
-                Tags: if i == record.history.len().saturating_sub(1) {
-                    Some(record.repo_tags.clone())
-                } else {
-                    None
-                },
-            }
-        })
+        .filter(|(_, h)| h.empty_layer != Some(true))
+        .map(|(i, _)| i)
         .collect();
+    // Effective tags for the top row (index truth, not stale embeds).
+    let top_tags = state.images.effective_tags(&record).await;
+    let mut items: Vec<HistoryResponseItem> = Vec::with_capacity(record.history.len());
+    for (rev_i, (i, h)) in record.history.iter().enumerate().rev().enumerate() {
+        let (id, size) = if h.empty_layer == Some(true) {
+            ("<missing>".to_string(), 0)
+        } else {
+            // Position of this layer among non-empty layers, bottom-up.
+            let pos = layer_order.iter().position(|&k| k == i).unwrap_or(0);
+            let id = record
+                .chain_ids
+                .get(pos)
+                .cloned()
+                .unwrap_or_else(|| format!("sha256:{}", record.id));
+            let size = record
+                .layer_blobs
+                .get(pos)
+                .and_then(|d| state.images.blob_size(d))
+                .unwrap_or(0) as i64;
+            (id, size)
+        };
+        items.push(HistoryResponseItem {
+            Comment: h.comment.clone().unwrap_or_default(),
+            Created: chrono::DateTime::parse_from_rfc3339(&h.created)
+                .map(|d| d.timestamp())
+                .unwrap_or(0),
+            CreatedBy: h.created_by.clone(),
+            Id: id,
+            Size: size,
+            // Repo tags sit on the top layer: the first row printed.
+            Tags: if rev_i == 0 {
+                Some(top_tags.clone())
+            } else {
+                None
+            },
+        });
+    }
     axum::Json(items).into_response()
 }
 
@@ -266,31 +478,42 @@ pub async fn remove(
     Query(q): Query<DeleteParams>,
 ) -> Response {
     let _ = q.noprune;
-    let id = state.images.resolve(&name).await.unwrap_or_else(|_| name.clone());
+    let id = state
+        .images
+        .resolve(&name)
+        .await
+        .unwrap_or_else(|_| name.clone());
     let record = match state.images.load(&id).await {
         Ok(Some(r)) => r,
         _ => return not_found(format!("No such image: {name}")),
     };
     let mut events: Vec<ImageDeleteResponseItem> = Vec::new();
     // If the reference is a tag (not an id) and more tags exist, just untag.
-    let tag_key = record.repo_tags.iter().find(|t| *t == &name || t.starts_with(&format!("{name}:")));
-    if tag_key.is_some() && record.repo_tags.len() > 1 {
-        if q.force != Some(true) {
-            let t = tag_key.unwrap().clone();
-            match state.images.remove_image(&id, Some(&t)).await {
-                Ok(_) => events.push(ImageDeleteResponseItem {
-                    Untagged: t,
-                    Deleted: String::new(),
-                }),
-                Err(e) => return server_error(e),
-            }
-            return axum::Json(events).into_response();
+    let tag_key = record
+        .repo_tags
+        .iter()
+        .find(|t| *t == &name || t.starts_with(&format!("{name}:")));
+    let untag_only = match tag_key {
+        Some(t) if record.repo_tags.len() > 1 && q.force != Some(true) => Some(t.clone()),
+        _ => None,
+    };
+    if let Some(t) = untag_only {
+        match state.images.remove_image(&id, Some(&t)).await {
+            Ok(_) => events.push(ImageDeleteResponseItem {
+                Untagged: t,
+                Deleted: String::new(),
+            }),
+            Err(e) => return server_error(e),
         }
+        return axum::Json(events).into_response();
     }
     match state.images.remove_image(&id, None).await {
         Ok(r) => {
             for t in &r.repo_tags {
-                events.push(ImageDeleteResponseItem { Untagged: t.clone(), Deleted: String::new() });
+                events.push(ImageDeleteResponseItem {
+                    Untagged: t.clone(),
+                    Deleted: String::new(),
+                });
             }
             events.push(ImageDeleteResponseItem {
                 Untagged: String::new(),
@@ -315,19 +538,26 @@ pub struct ImagePruneQuery {
     filters: Option<String>,
 }
 
-/// POST /images/prune
-pub async fn prune(
-    State(state): State<SharedState>,
-    Query(q): Query<ImagePruneQuery>,
-) -> Response {
-    let dangling_only = match q.filters {
-        Some(ref f) => {
-            !f.contains("\"dangling\":[\"false\"]") && !f.contains("\"dangling\":[\"0\"]")
-        }
-        None => true,
+/// POST /images/prune — filters: dangling (default true), until, label.
+/// Unknown keys are an explicit 400 (unit 4.4).
+pub async fn prune(State(state): State<SharedState>, Query(q): Query<ImagePruneQuery>) -> Response {
+    let filters = match parse_filter_map(q.filters.as_ref()) {
+        Ok(m) => m,
+        Err(resp) => return resp,
     };
+    // Docker default: without filters, only dangling images are pruned.
+    let filters = if filters.is_empty() {
+        let mut m = serde_json::Map::new();
+        m.insert("dangling".to_string(), serde_json::json!(["true"]));
+        m
+    } else {
+        filters
+    };
+    let now = now_unix();
 
-    let all_images = match state.images.list().await {
+    // Effective tags: pruning matches index truth, so records whose tag
+    // has moved on (or away) prune as dangling.
+    let all_images = match state.images.list_effective().await {
         Ok(imgs) => imgs,
         Err(e) => return server_error(format!("failed to list images: {e}")),
     };
@@ -337,10 +567,8 @@ pub async fn prune(
     } else {
         Vec::new()
     };
-    let used_image_ids: std::collections::HashSet<String> = containers
-        .iter()
-        .map(|c| c.image_id.clone())
-        .collect();
+    let used_image_ids: std::collections::HashSet<String> =
+        containers.iter().map(|c| c.image_id.clone()).collect();
 
     let mut deleted_items = Vec::new();
     let mut space_reclaimed: u64 = 0;
@@ -352,10 +580,10 @@ pub async fn prune(
         if is_used {
             continue;
         }
-        let is_dangling = img.repo_tags.is_empty()
-            || img.repo_tags.iter().all(|t| t == "<none>:<none>");
-        if dangling_only && !is_dangling {
-            continue;
+        match image_matches(&img, &filters, now) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(resp) => return resp,
         }
 
         if let Ok(rec) = state.images.remove_image(&img.id, None).await {
@@ -374,7 +602,11 @@ pub async fn prune(
     }
 
     let report = ImagesPruneReport {
-        ImagesDeleted: if deleted_items.is_empty() { None } else { Some(deleted_items) },
+        ImagesDeleted: if deleted_items.is_empty() {
+            None
+        } else {
+            Some(deleted_items)
+        },
         SpaceReclaimed: space_reclaimed,
     };
     axum::Json(report).into_response()
@@ -431,14 +663,10 @@ fn tar_dir_recursive<W: std::io::Write>(
     Ok(())
 }
 
-
 /// GET /images/get
-pub async fn get_tar(
-    State(state): State<SharedState>,
-    Query(q): Query<ImageGetQuery>,
-) -> Response {
+pub async fn get_tar(State(state): State<SharedState>, Query(q): Query<ImageGetQuery>) -> Response {
     let images_to_save: Vec<String> = if q.names.is_empty() {
-        let all = state.images.list().await.unwrap_or_default();
+        let all = state.images.list_effective().await.unwrap_or_default();
         all.into_iter().map(|img| img.id).collect()
     } else {
         q.names
@@ -448,7 +676,11 @@ pub async fn get_tar(
     let mut manifests = Vec::new();
 
     for img_name in images_to_save {
-        let id = state.images.resolve(&img_name).await.unwrap_or_else(|_| img_name.clone());
+        let id = state
+            .images
+            .resolve(&img_name)
+            .await
+            .unwrap_or_else(|_| img_name.clone());
         let record = match state.images.load(&id).await {
             Ok(Some(r)) => r,
             _ => continue,
@@ -479,7 +711,12 @@ pub async fn get_tar(
             let mut layer_tar = tar::Builder::new(Vec::new());
             if layer_dir.exists() {
                 let mut seen_inodes = std::collections::HashMap::new();
-                let _ = tar_dir_recursive(&mut layer_tar, &layer_dir, std::path::Path::new(""), &mut seen_inodes);
+                let _ = tar_dir_recursive(
+                    &mut layer_tar,
+                    &layer_dir,
+                    std::path::Path::new(""),
+                    &mut seen_inodes,
+                );
             }
             let layer_tar_bytes = match layer_tar.into_inner() {
                 Ok(b) => b,
@@ -490,16 +727,19 @@ pub async fn get_tar(
             l_hdr.set_size(layer_tar_bytes.len() as u64);
             l_hdr.set_mode(0o644);
             l_hdr.set_cksum();
-            if let Err(e) = outer_tar.append_data(&mut l_hdr, &layer_tar_name, &layer_tar_bytes[..]) {
+            if let Err(e) = outer_tar.append_data(&mut l_hdr, &layer_tar_name, &layer_tar_bytes[..])
+            {
                 return server_error(format!("failed to append layer to tar: {e}"));
             }
 
             layer_tar_paths.push(layer_tar_name);
         }
 
+        // Effective tags only: a stale embedded tag must not leak into the
+        // tar and steal the tag back on load.
         let manifest_entry = serde_json::json!({
             "Config": config_tar_path,
-            "RepoTags": record.repo_tags,
+            "RepoTags": state.images.effective_tags(&record).await,
             "Layers": layer_tar_paths,
         });
         manifests.push(manifest_entry);
@@ -535,10 +775,7 @@ pub async fn get_tar_single(
 }
 
 /// POST /images/load
-pub async fn load_tar(
-    State(state): State<SharedState>,
-    body: axum::body::Bytes,
-) -> Response {
+pub async fn load_tar(State(state): State<SharedState>, body: axum::body::Bytes) -> Response {
     let cursor = std::io::Cursor::new(body);
     let mut archive = tar::Archive::new(cursor);
 
@@ -562,6 +799,8 @@ pub async fn load_tar(
     };
 
     #[derive(serde::Deserialize)]
+    // Field names mirror docker's manifest.json verbatim.
+    #[allow(non_snake_case)]
     struct ManifestEntry {
         Config: String,
         RepoTags: Option<Vec<String>>,
@@ -579,7 +818,9 @@ pub async fn load_tar(
         let config_file = tmp_dir.path().join(&item.Config);
         let config_bytes = match std::fs::read(&config_file) {
             Ok(b) => b,
-            Err(e) => return server_error(format!("failed to read image config {}: {e}", item.Config)),
+            Err(e) => {
+                return server_error(format!("failed to read image config {}: {e}", item.Config))
+            }
         };
         let config_val: serde_json::Value = match serde_json::from_slice(&config_bytes) {
             Ok(v) => v,
@@ -632,19 +873,36 @@ pub async fn load_tar(
         }
 
         let repo_tags = item.RepoTags.unwrap_or_default();
-        let created = config_val.get("created").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        let arch = config_val.get("architecture").and_then(|v| v.as_str()).unwrap_or("amd64").to_string();
-        let os = config_val.get("os").and_then(|v| v.as_str()).unwrap_or("linux").to_string();
+        let created = config_val
+            .get("created")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let arch = config_val
+            .get("architecture")
+            .and_then(|v| v.as_str())
+            .unwrap_or("amd64")
+            .to_string();
+        let os = config_val
+            .get("os")
+            .and_then(|v| v.as_str())
+            .unwrap_or("linux")
+            .to_string();
 
         let chain_ids = ingot_image::ImageRecord::compute_chain_ids(&diff_ids);
 
+        // A load restores the image's own creation time; stamping now would
+        // make every loaded image look brand-new to until-filters.
+        let created_unix = chrono::DateTime::parse_from_rfc3339(&created)
+            .map(|d| d.timestamp())
+            .unwrap_or(0);
         let rec = ingot_image::ImageRecord {
             id: config_id.clone(),
             manifest_digest: String::new(),
             repo_tags: repo_tags.clone(),
             repo_digests: Vec::new(),
             created,
-            created_unix: ingot_util::now_unix(),
+            created_unix,
             architecture: arch,
             os,
             author: String::new(),
@@ -653,13 +911,39 @@ pub async fn load_tar(
             diff_ids,
             layer_blobs,
             size: total_size,
-            config: serde_json::from_value(config_val.get("config").cloned().unwrap_or(serde_json::Value::Null)).unwrap_or_default(),
+            config: serde_json::from_value(
+                config_val
+                    .get("config")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .unwrap_or_default(),
             history: Vec::new(),
             chain_ids,
         };
 
-        if let Err(e) = state.images.put_image(&rec).await {
+        // Merged, not blind overwrite: a load of a pulled image must keep
+        // the pull's manifest digest and RepoDigests (same rule as pull).
+        let prev = state.images.load(&config_id).await.ok().flatten();
+        if let Err(e) = state.images.put_image_merged(&rec).await {
             return server_error(format!("failed to save image record: {e}"));
+        }
+        // Same-id layer swap orphans the previous revision's blobs/dirs
+        // with no record deletion to GC them: collect those nothing else
+        // references. Skipped while a container uses the image — a live
+        // overlay still reads the old lowerdirs.
+        if let Some(old) = prev {
+            if old.diff_ids != rec.diff_ids || old.layer_blobs != rec.layer_blobs {
+                let in_use = match state.containers.as_ref() {
+                    Some(mgr) => mgr.list_records().await.iter().any(|c| {
+                        c.image_id == config_id || c.image_id == format!("sha256:{config_id}")
+                    }),
+                    None => false,
+                };
+                if !in_use {
+                    let _ = state.images.gc_replaced_layers(&old).await;
+                }
+            }
         }
 
         for tag in &repo_tags {
@@ -684,3 +968,111 @@ pub async fn load_tar(
         .unwrap()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filters(json: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        match json {
+            serde_json::Value::Object(m) => m,
+            _ => panic!("object"),
+        }
+    }
+
+    fn record(tags: &[&str], created_unix: i64) -> ingot_image::ImageRecord {
+        ingot_image::ImageRecord {
+            repo_tags: tags.iter().map(|s| s.to_string()).collect(),
+            created_unix,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pull_spec_assembly() {
+        assert_eq!(assemble_pull_spec("busybox", "latest"), "busybox:latest");
+        assert_eq!(assemble_pull_spec("busybox", ""), "busybox");
+        assert_eq!(assemble_pull_spec("busybox:1.36", "1.36"), "busybox:1.36");
+        // Digest split across params joins with '@', never ':'.
+        assert_eq!(
+            assemble_pull_spec("busybox", "sha256:abc"),
+            "busybox@sha256:abc"
+        );
+        assert_eq!(
+            assemble_pull_spec("busybox:1.36", "sha256:abc"),
+            "busybox:1.36@sha256:abc"
+        );
+        assert_eq!(
+            assemble_pull_spec("busybox", "1.36@sha256:abc"),
+            "busybox:1.36@sha256:abc"
+        );
+        // Already-pinned spec is complete; a stray tag is ignored.
+        assert_eq!(
+            assemble_pull_spec("busybox@sha256:abc", "latest"),
+            "busybox@sha256:abc"
+        );
+    }
+
+    #[test]
+    fn until_value_shapes() {
+        let now = 1_000_000i64;
+        assert_eq!(parse_until("999999", now).unwrap(), 999999);
+        assert_eq!(parse_until("1970-01-01T00:00:10Z", now).unwrap(), 10);
+        assert_eq!(parse_until("60s", now).unwrap(), now - 60);
+        assert_eq!(parse_until("1h30m", now).unwrap(), now - 5400);
+        assert_eq!(parse_until("24h", now).unwrap(), now - 86400);
+        for bad in ["", "yesterday", "1d", "h", "1h30", "-5", "1.5h"] {
+            assert!(parse_until(bad, now).is_err(), "{bad:?} must fail");
+        }
+    }
+
+    #[test]
+    fn until_matching_uses_created_age() {
+        let now = 1_000_000i64;
+        let old = record(&["img:old"], 100);
+        let fresh = record(&["img:new"], 999_999);
+        let ageless = record(&["img:?"], 0);
+        let f = filters(serde_json::json!({"until": ["1h"]}));
+        assert!(image_matches(&old, &f, now).unwrap());
+        assert!(!image_matches(&fresh, &f, now).unwrap());
+        // Unknown age never matches: it cannot be aged.
+        assert!(!image_matches(&ageless, &f, now).unwrap());
+    }
+
+    #[test]
+    fn prune_default_is_dangling_only_via_matches() {
+        let tagged = record(&["img:t"], 1);
+        let dangling = record(&[], 1);
+        let f = filters(serde_json::json!({"dangling": ["true"]}));
+        assert!(!image_matches(&tagged, &f, 9).unwrap());
+        assert!(image_matches(&dangling, &f, 9).unwrap());
+        let f = filters(serde_json::json!({"dangling": ["false"]}));
+        assert!(image_matches(&tagged, &f, 9).unwrap());
+    }
+
+    #[test]
+    fn docker_map_shaped_filters_match() {
+        // The real CLI sends {"dangling":{"true":true}}, not arrays.
+        let tagged = record(&["img:t"], 1);
+        let dangling = record(&[], 1);
+        let f = filters(serde_json::json!({"dangling": {"true": true}}));
+        assert!(!image_matches(&tagged, &f, 9).unwrap());
+        assert!(image_matches(&dangling, &f, 9).unwrap());
+        let f = filters(serde_json::json!({"dangling": {"false": true}}));
+        assert!(image_matches(&tagged, &f, 9).unwrap());
+        assert!(!image_matches(&dangling, &f, 9).unwrap());
+    }
+
+    #[test]
+    fn unknown_filter_key_is_400() {
+        let r = record(&["img:t"], 1);
+        let f = filters(serde_json::json!({"bogus": ["x"]}));
+        assert!(image_matches(&r, &f, 9).is_err());
+    }
+
+    #[test]
+    fn invalid_until_value_is_400() {
+        let r = record(&["img:t"], 1);
+        let f = filters(serde_json::json!({"until": ["yesterday"]}));
+        assert!(image_matches(&r, &f, 9).is_err());
+    }
+}

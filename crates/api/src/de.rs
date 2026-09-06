@@ -55,7 +55,10 @@ where
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Vec<String>, E> {
             Ok(vec![v.to_string()])
         }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<String>, A::Error> {
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Vec<String>, A::Error> {
             let mut out = Vec::new();
             while let Some(s) = seq.next_element::<String>()? {
                 out.push(s);

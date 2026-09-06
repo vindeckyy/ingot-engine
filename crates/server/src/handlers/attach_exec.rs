@@ -9,9 +9,9 @@ use crate::state::SharedState;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
-use hyper::http as http;
 use axum::response::{IntoResponse, Response};
-use ingot_runtime::stdio::{frame, StdioHub, STREAM_STDERR, STREAM_STDOUT};
+use hyper::http;
+use ingot_runtime::stdio::{frame, STREAM_STDERR, STREAM_STDOUT};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -126,7 +126,7 @@ pub async fn attach(
         }
 
         // hub → client
-        let (mut rsock, mut wsock) = tokio::io::split(sock);
+        let (rsock, mut wsock) = tokio::io::split(sock);
         let writer = tokio::spawn(async move {
             let mut rx = rx;
             loop {
@@ -186,7 +186,12 @@ pub async fn attach(
         .unwrap()
 }
 
-fn read_log_frames(log_path: &std::path::Path, tty: bool, want_out: bool, want_err: bool) -> Vec<u8> {
+fn read_log_frames(
+    log_path: &std::path::Path,
+    tty: bool,
+    want_out: bool,
+    want_err: bool,
+) -> Vec<u8> {
     let raw = std::fs::read(log_path).unwrap_or_default();
     let mut out = Vec::new();
     for line in raw.split(|&b| b == b'\n') {
@@ -194,8 +199,13 @@ fn read_log_frames(log_path: &std::path::Path, tty: bool, want_out: bool, want_e
             continue;
         }
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
-            let stream = if v["stream"] == "stderr" { STREAM_STDERR } else { STREAM_STDOUT };
-            let keep = (stream == STREAM_STDOUT && want_out) || (stream == STREAM_STDERR && want_err);
+            let stream = if v["stream"] == "stderr" {
+                STREAM_STDERR
+            } else {
+                STREAM_STDOUT
+            };
+            let keep =
+                (stream == STREAM_STDOUT && want_out) || (stream == STREAM_STDERR && want_err);
             if !keep {
                 continue;
             }
@@ -211,13 +221,6 @@ fn read_log_frames(log_path: &std::path::Path, tty: bool, want_out: bool, want_e
 }
 
 // ---------------- exec ----------------
-
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-pub struct ExecCreateQuery {
-    #[serde(default)]
-    name: Option<String>,
-}
 
 /// POST /containers/{id}/exec
 pub async fn exec_create(
@@ -255,9 +258,13 @@ pub async fn exec_create(
 
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
+// Field names mirror the Engine API exec-start body verbatim.
+#[allow(non_snake_case)]
 pub struct ExecStartBody {
     #[serde(default)]
     Detach: bool,
+    // Accepted for API compatibility; tty framing for exec lands in Plan 2.x.
+    #[allow(dead_code)]
     #[serde(default)]
     Tty: bool,
 }
@@ -266,7 +273,7 @@ pub struct ExecStartBody {
 pub async fn exec_start(
     State(state): State<SharedState>,
     Path(eid): Path<String>,
-    mut req: axum::extract::Request,
+    req: axum::extract::Request,
 ) -> Response {
     let mgr = state.containers.as_ref().unwrap();
     let session = match mgr.exec_session(&eid) {
@@ -318,7 +325,7 @@ pub async fn exec_start(
                 return;
             }
         };
-        let (mut rsock, mut wsock) = tokio::io::split(sock);
+        let (rsock, mut wsock) = tokio::io::split(sock);
 
         // hub → client
         let writer = tokio::spawn(async move {

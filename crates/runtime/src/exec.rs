@@ -6,9 +6,9 @@
 
 use crate::manager::ContainerHandle;
 use crate::stdio::{pump_pipe, StdioHub, STREAM_STDERR, STREAM_STDOUT};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -45,6 +45,10 @@ impl ExecSession {
 }
 
 impl ExecSession {
+    // Eight fields by design: mirrors the Engine API exec-create body plus
+    // the log path, so bundling them would add a type without removing a
+    // parameter.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         container_id: String,
         cmd: Vec<String>,
@@ -105,7 +109,9 @@ pub fn start_exec(
 
     // Open the container's namespace fds while it is alive.
     let ns = |name: &str| -> Result<std::fs::File> {
-        Ok(std::fs::File::open(format!("/proc/{container_pid}/ns/{name}"))?)
+        Ok(std::fs::File::open(format!(
+            "/proc/{container_pid}/ns/{name}"
+        ))?)
     };
     let pid_fd = ns("pid")?;
     let mnt_fd = ns("mnt")?;
@@ -139,6 +145,27 @@ pub fn start_exec(
         session.workdir.as_str()
     })?;
     let (uid, gid) = parse_user(&session.user, &handle);
+    // Exec sessions run with the container's capability set and resource
+    // limits, not the daemon's (Plan Phase 3, units 3.1/3.4).
+    let (exec_cap_add, exec_cap_drop, exec_privileged, exec_ulimits) = {
+        let rec = handle.record.lock().unwrap();
+        (
+            rec.hostconfig.CapAdd.clone(),
+            rec.hostconfig.CapDrop.clone(),
+            rec.hostconfig.Privileged,
+            crate::error::parse_ulimits(&rec.hostconfig)
+                .map_err(|e| anyhow!("invalid ulimits: {e}"))?,
+        )
+    };
+    // Pin the container's root before forking: after setns into the mount
+    // namespace `/` may resolve to a stale pre-pivot tree.
+    let root_dir: std::fs::File = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(format!("/proc/{container_pid}/root"))?
+    };
 
     // Stdio pipes.
     let (in_r, in_w) = tokio::net::UnixStream::pair()?;
@@ -179,13 +206,22 @@ pub fn start_exec(
     // are not Send); the CStrings themselves are.
 
     // The fork dance happens on a blocking thread.
-    let ids = NsFds { pid: pid_fd, mnt: mnt_fd, net: net_fd, ipc: ipc_fd, uts: uts_fd };
+    let ids = NsFds {
+        pid: pid_fd,
+        mnt: mnt_fd,
+        net: net_fd,
+        ipc: ipc_fd,
+        uts: uts_fd,
+        root: root_dir,
+    };
     let in_fd = child_in;
     let out_fd = child_out;
     let err_fd = child_err;
     let wd = workdir;
-    let uid = uid;
-    let gid = gid;
+    let cap_add = exec_cap_add;
+    let cap_drop = exec_cap_drop;
+    let privileged = exec_privileged;
+    let ulimits_for_exec = exec_ulimits;
     let argv_for_exec = argv;
     let envp_for_exec = envp;
 
@@ -210,9 +246,7 @@ pub fn start_exec(
         let prog = argv[0].as_ptr();
         // fork1: enters pidns via setns, then forks the real child.
         let report = |msg: &[u8]| {
-            unsafe {
-                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-            }
+            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
         };
         let pid1 = libc::fork();
         if pid1 == 0 {
@@ -238,6 +272,29 @@ pub fn start_exec(
                 nsjoin(ids.ipc.as_raw_fd(), libc::CLONE_NEWIPC, "ipc");
                 nsjoin(ids.uts.as_raw_fd(), libc::CLONE_NEWUTS, "uts");
                 nsjoin(ids.mnt.as_raw_fd(), libc::CLONE_NEWNS, "mnt");
+                // Enter the container's root through the pinned fd: path
+                // `/` in this namespace can resolve to a stale pre-pivot
+                // tree. Runs before caps drop (chroot needs privilege).
+                {
+                    let rfd = ids.root.as_raw_fd();
+                    if libc::fchdir(rfd) != 0 || libc::chroot(c".".as_ptr()) != 0 {
+                        let e = std::io::Error::last_os_error();
+                        let msg =
+                            format!("exec: chroot to container root failed: {e}\n").into_bytes();
+                        report(&msg);
+                        libc::_exit(126);
+                    }
+                    libc::close(rfd);
+                }
+                // Container ulimits, like init's (raising hard limits needs
+                // the privilege still held here, before caps drop).
+                for (name, soft, hard) in &ulimits_for_exec {
+                    if let Err(what) = crate::child::apply_rlimit(name, *soft, *hard) {
+                        let msg = format!("exec: ulimit {name} failed: {what}\n").into_bytes();
+                        report(&msg);
+                        libc::_exit(126);
+                    }
+                }
                 libc::dup2(in_fd, 0);
                 libc::dup2(out_fd, 1);
                 libc::dup2(err_fd, 2);
@@ -248,14 +305,39 @@ pub fn start_exec(
                         libc::close(fd);
                     }
                 }
+                // Drop to the container's capability set while fully
+                // privileged: bounding drops need CAP_SETPCAP (unit 3.1).
+                let keep = crate::child::compute_keep(&cap_add, &cap_drop, privileged);
+                if let Some(k) = keep.as_ref() {
+                    if !crate::child::confine_caps(k) {
+                        report(b"exec: dropping capabilities failed\n");
+                        libc::_exit(126);
+                    }
+                }
                 if uid != u32::MAX {
+                    // Keep Permitted across the switch; the uid change
+                    // clears Effective, re-asserted below.
+                    libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0);
                     libc::setgroups(0, std::ptr::null());
                     libc::setresgid(gid as libc::gid_t, gid as libc::gid_t, gid as libc::gid_t);
                     libc::setresuid(uid as libc::uid_t, uid as libc::uid_t, uid as libc::uid_t);
+                    if let Some(k) = keep.as_ref() {
+                        if !crate::child::restore_effective(k) {
+                            report(b"exec: restoring capabilities failed\n");
+                            libc::_exit(126);
+                        }
+                    }
+                }
+                // Mirror container init (child.rs step 9): a non-privileged
+                // exec must not regain dropped caps (or anything else) at
+                // the execve below. NO_NEW_PRIVS is inherited and one-way.
+                if !privileged && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    report(b"exec: setting NO_NEW_PRIVS failed\n");
+                    libc::_exit(126);
                 }
                 if libc::chdir(wd.as_ptr()) != 0 {
                     // workdir may be missing; fall back to /
-                    libc::chdir(b"/\0".as_ptr() as *const libc::c_char);
+                    libc::chdir(c"/".as_ptr());
                 }
                 // PATH resolution for bare names (busybox applets etc.).
                 let prog_bytes = argv[0].as_bytes();
@@ -272,9 +354,15 @@ pub fn start_exec(
                                 None
                             }
                         })
-                        .unwrap_or_else(|| b"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_vec());
+                        .unwrap_or_else(|| {
+                            b"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_vec()
+                        });
                     for dir in path_env.split(|&b| b == b':') {
-                        let mut cand = if dir.is_empty() { b"/".to_vec() } else { dir.to_vec() };
+                        let mut cand = if dir.is_empty() {
+                            b"/".to_vec()
+                        } else {
+                            dir.to_vec()
+                        };
                         if !cand.ends_with(b"/") {
                             cand.push(b'/');
                         }
@@ -287,12 +375,20 @@ pub fn start_exec(
                 let e = std::io::Error::last_os_error();
                 let msg = format!("exec: execve failed: {e}\n").into_bytes();
                 report(&msg);
-                libc::_exit(if e.raw_os_error() == Some(libc::ENOENT) { 127 } else { 126 });
+                libc::_exit(if e.raw_os_error() == Some(libc::ENOENT) {
+                    127
+                } else {
+                    126
+                });
             } else if pid2 > 0 {
                 // child1: wait for child2, mirror its exit status.
                 let mut status = 0;
                 libc::waitpid(pid2, &mut status, 0);
-                let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { 1 };
+                let code = if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    1
+                };
                 libc::_exit(code);
             } else {
                 libc::_exit(126);
@@ -334,8 +430,6 @@ pub fn start_exec(
     Ok(())
 }
 
-
-
 fn parse_user(user: &str, handle: &ContainerHandle) -> (u32, u32) {
     let _ = handle;
     if user.is_empty() {
@@ -350,20 +444,14 @@ fn parse_user(user: &str, handle: &ContainerHandle) -> (u32, u32) {
 }
 
 /// Owns the namespace fds so they stay open for the life of the fork dance.
-/// Real os pipe (O_CLOEXEC): (read_fd, write_fd).
-fn os_pipe_pair() -> Result<(i32, i32)> {
-    let mut fds = [0i32; 2];
-    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    if rc != 0 {
-        return Err(anyhow!("pipe2: {}", std::io::Error::last_os_error()));
-    }
-    Ok((fds[0], fds[1]))
-}
-
 struct NsFds {
     pid: std::fs::File,
     mnt: std::fs::File,
     net: std::fs::File,
     ipc: std::fs::File,
     uts: std::fs::File,
+    /// Open handle on the container init's root (`/proc/<pid>/root`): the
+    /// mount namespace can contain a stale pre-pivot tree at `/`, so exec
+    /// chroots through this fd to see the same root as init.
+    root: std::fs::File,
 }

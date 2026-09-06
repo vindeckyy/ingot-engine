@@ -2,20 +2,17 @@
 //! to the container. Required for 127.0.0.1 reachability (DNAT can't loop
 //! back into the container) and used unconditionally like dockerd's default.
 
-use std::sync::Arc;
 use anyhow::Result;
 use std::net::IpAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
 use tokio::sync::watch;
-
-
 
 pub async fn run_proxy(
     bind_ip: IpAddr,
     port: u16,
     target: std::net::SocketAddr,
     proto: &str,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     match proto {
         "udp" => run_udp(bind_ip, port, target, shutdown).await,
@@ -39,7 +36,6 @@ async fn run_tcp(
                     Ok(c) => c,
                     Err(_) => continue,
                 };
-                let target = target;
                 tokio::spawn(async move {
                     let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await else {
                         tracing::debug!("proxy: connect to {target} failed");

@@ -74,10 +74,16 @@ impl hyper::rt::Write for UdsStream {
     ) -> Poll<Result<usize, std::io::Error>> {
         Pin::new(&mut self.0).poll_write(cx, buf)
     }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<(), std::io::Error>> {
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
         Pin::new(&mut self.0).poll_flush(cx)
     }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<(), std::io::Error>> {
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
         Pin::new(&mut self.0).poll_shutdown(cx)
     }
 }
@@ -88,7 +94,7 @@ impl Connection for UdsStream {
     }
 }
 
-pub type UdsClient = Client<UdsConnector, Full<Bytes>>;
+type UdsClient = Client<UdsConnector, Full<Bytes>>;
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -105,8 +111,9 @@ impl ApiClient {
                 socket.display()
             );
         }
-        let client =
-            Client::builder(TokioExecutor::new()).build(UdsConnector { path: socket.clone() });
+        let client = Client::builder(TokioExecutor::new()).build(UdsConnector {
+            path: socket.clone(),
+        });
         Ok(ApiClient { socket, client })
     }
 
@@ -166,11 +173,24 @@ impl ApiClient {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<Response<Incoming>> {
+        self.request_with_headers(method, path, body, &[]).await
+    }
+
+    pub async fn request_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Vec<u8>>,
+        headers: &[(&str, &str)],
+    ) -> Result<Response<Incoming>> {
         let uri = format!("http://ingot{path}");
         let mut req = hyper::Request::builder()
             .method(method)
             .uri(uri)
             .header("Host", "ingot");
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
         let body = match body {
             Some(b) => Full::new(Bytes::from(b)),
             None => Full::new(Bytes::new()),

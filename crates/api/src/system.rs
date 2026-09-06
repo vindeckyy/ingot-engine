@@ -124,13 +124,21 @@ pub struct EventActor {
 }
 
 impl EventMessage {
-    pub fn new(typ: &str, action: &str, id: &str, attrs: std::collections::HashMap<String, String>) -> Self {
+    pub fn new(
+        typ: &str,
+        action: &str,
+        id: &str,
+        attrs: std::collections::HashMap<String, String>,
+    ) -> Self {
         let now = chrono::Utc::now();
         let from = attrs.get("image").cloned().unwrap_or_default();
         EventMessage {
             Type: typ.into(),
             Action: action.into(),
-            Actor: EventActor { ID: id.into(), Attributes: attrs },
+            Actor: EventActor {
+                ID: id.into(),
+                Attributes: attrs,
+            },
             scope: "local".into(),
             time: now.timestamp(),
             timeNano: now.timestamp_nanos_opt().unwrap_or_default(),
@@ -158,7 +166,10 @@ pub struct SystemDFResponse {
 }
 
 /// X-Registry-Auth header payload (base64 of this JSON).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Secret hygiene (Plan Phase 3, unit 3.6): credentials are request-scoped
+/// (never persisted) and the Debug impl redacts secrets so a stray
+/// `debug!("{auth:?}")` cannot leak them into daemon logs.
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AuthConfig {
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -171,4 +182,45 @@ pub struct AuthConfig {
     pub auth: String,
     #[serde(rename = "identitytoken", skip_serializing_if = "String::is_empty")]
     pub identity_token: String,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |s: &str| {
+            if s.is_empty() {
+                "<empty>".to_string()
+            } else {
+                "<redacted>".to_string()
+            }
+        };
+        f.debug_struct("AuthConfig")
+            .field("username", &self.username)
+            .field("password", &redact(&self.password))
+            .field("server_address", &self.server_address)
+            .field("auth", &redact(&self.auth))
+            .field("identity_token", &redact(&self.identity_token))
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_debug_redacts_secrets() {
+        let a = AuthConfig {
+            username: "user".into(),
+            password: "s3cret".into(),
+            server_address: "registry.example".into(),
+            auth: "dXNlcjpzM2NyZXQ=".into(),
+            identity_token: "tok123".into(),
+        };
+        let dbg = format!("{a:?}");
+        assert!(dbg.contains("user"), "{dbg}");
+        assert!(dbg.contains("registry.example"), "{dbg}");
+        for secret in ["s3cret", "dXNlcjpzM2NyZXQ=", "tok123"] {
+            assert!(!dbg.contains(secret), "leaked {secret:?}: {dbg}");
+        }
+    }
 }

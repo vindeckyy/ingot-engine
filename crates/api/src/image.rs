@@ -122,10 +122,16 @@ pub struct ProgressMessage {
 
 impl ProgressMessage {
     pub fn stream(s: impl Into<String>) -> Self {
-        ProgressMessage { stream: Some(s.into()), ..Default::default() }
+        ProgressMessage {
+            stream: Some(s.into()),
+            ..Default::default()
+        }
     }
     pub fn status(s: impl Into<String>) -> Self {
-        ProgressMessage { status: Some(s.into()), ..Default::default() }
+        ProgressMessage {
+            status: Some(s.into()),
+            ..Default::default()
+        }
     }
     pub fn error(s: impl Into<String>) -> Self {
         let msg: String = s.into();
@@ -182,4 +188,3 @@ pub struct ImagesPruneReport {
     pub ImagesDeleted: Option<Vec<ImageDeleteResponseItem>>,
     pub SpaceReclaimed: u64,
 }
-

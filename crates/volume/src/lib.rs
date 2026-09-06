@@ -105,9 +105,34 @@ impl VolumeManager {
         Ok(())
     }
 
-    pub fn prune(&self) -> Result<Vec<String>> {
+    /// Remove volumes not in `protected`, honoring `until` (unix
+    /// timestamp, older-than) and `label_filter` (all key/value pairs
+    /// must match; empty value means the key must simply exist). Never
+    /// removes a protected (in-use) volume. Returns the deleted names.
+    pub fn prune(
+        &self,
+        protected: &[&str],
+        until: Option<i64>,
+        label_filter: &HashMap<String, String>,
+    ) -> Result<Vec<String>> {
+        let protected: std::collections::HashSet<&str> = protected.iter().copied().collect();
+        let now = chrono::Utc::now().timestamp();
         let mut removed = Vec::new();
         for vol in self.list()? {
+            if protected.contains(vol.Name.as_str()) {
+                continue;
+            }
+            if until.is_some_and(|ts| {
+                // CreatedAt may be missing/malformed for legacy volumes: treat
+                // unknown age as not-matching, safer than deleting blindly.
+                let created = parse_rfc3339(&vol.CreatedAt).unwrap_or(now);
+                created > ts
+            }) {
+                continue;
+            }
+            if !label_filter.is_empty() && !labels_match(&vol.Labels, label_filter) {
+                continue;
+            }
             if self.remove(&vol.Name).is_ok() {
                 removed.push(vol.Name);
             }
@@ -135,5 +160,76 @@ impl VolumeManager {
             Options: meta.options.clone(),
             Scope: "local".into(),
         }
+    }
+}
+
+fn parse_rfc3339(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.timestamp())
+}
+
+fn labels_match(vol: &HashMap<String, String>, filter: &HashMap<String, String>) -> bool {
+    for (k, v) in filter {
+        match vol.get(k) {
+            Some(got) if v.is_empty() || got == v => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_paths(tag: &str) -> DataPaths {
+        let dir = std::env::temp_dir().join(format!("ingot-vol-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        DataPaths::new(&dir, dir.join("run"))
+    }
+
+    #[test]
+    fn prune_respects_protected() {
+        let paths = tmp_paths("prot");
+        let vm = VolumeManager::new(paths.clone()).unwrap();
+        let _ = vm.create(Some("keep"), None, HashMap::new(), HashMap::new());
+        let _ = vm.create(Some("drop"), None, HashMap::new(), HashMap::new());
+        let removed = vm.prune(&["keep"], None, &HashMap::new()).unwrap();
+        assert_eq!(removed, vec!["drop".to_string()]);
+        assert!(vm.get("keep").unwrap().is_some());
+        assert!(vm.get("drop").unwrap().is_none());
+    }
+
+    #[test]
+    fn prune_filters_labels_and_until() {
+        let paths = tmp_paths("filters");
+        let vm = VolumeManager::new(paths.clone()).unwrap();
+        let mut labels = HashMap::new();
+        labels.insert("env".to_string(), "test".to_string());
+        let _ = vm.create(Some("match-me"), None, labels.clone(), HashMap::new());
+        let _ = vm.create(Some("no-label"), None, HashMap::new(), HashMap::new());
+
+        let mut filter = HashMap::new();
+        filter.insert("env".to_string(), "test".to_string());
+        let removed = vm.prune(&[], None, &filter).unwrap();
+        assert_eq!(removed, vec!["match-me".to_string()]);
+
+        // until filter: far past deletes nothing (all test volumes are new).
+        let now = chrono::Utc::now().timestamp();
+        let removed = vm.prune(&[], Some(now - 86400), &HashMap::new()).unwrap();
+        assert!(removed.is_empty(), "past until should delete nothing");
+
+        // Far future until deletes the remaining volume.
+        let removed = vm.prune(&[], Some(now + 86400), &HashMap::new()).unwrap();
+        assert_eq!(removed, vec!["no-label".to_string()]);
+    }
+
+    #[test]
+    fn prune_empty_is_safe() {
+        let paths = tmp_paths("empty");
+        let vm = VolumeManager::new(paths).unwrap();
+        let removed = vm.prune(&[], None, &HashMap::new()).unwrap();
+        assert!(removed.is_empty());
     }
 }

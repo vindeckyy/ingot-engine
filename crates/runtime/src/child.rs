@@ -5,7 +5,7 @@
 //! clone the child only makes syscalls, avoiding malloc locks held by other
 //! daemon threads in the CoW memory snapshot.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 
@@ -29,12 +29,47 @@ pub const DEFAULT_CAPS: &[&str] = &[
 
 /// All capabilities (used with --privileged).
 pub const ALL_CAPS: &[&str] = &[
-    "CHOWN", "DAC_OVERRIDE", "DAC_READ_SEARCH", "FOWNER", "FSETID", "KILL", "SETGID", "SETUID",
-    "SETPCAP", "LINUX_IMMUTABLE", "NET_BIND_SERVICE", "NET_BROADCAST", "NET_ADMIN", "NET_RAW",
-    "IPC_LOCK", "IPC_OWNER", "SYS_MODULE", "SYS_RAWIO", "SYS_CHROOT", "SYS_PTRACE", "SYS_PACCT",
-    "SYS_ADMIN", "SYS_BOOT", "SYS_NICE", "SYS_RESOURCE", "SYS_TIME", "SYS_TTY_CONFIG", "MKNOD",
-    "LEASE", "AUDIT_WRITE", "AUDIT_CONTROL", "SETFCAP", "MAC_OVERRIDE", "MAC_ADMIN", "SYSLOG",
-    "WAKE_ALARM", "BLOCK_SUSPEND", "AUDIT_READ", "PERFMON", "BPF", "CHECKPOINT_RESTORE",
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "DAC_READ_SEARCH",
+    "FOWNER",
+    "FSETID",
+    "KILL",
+    "SETGID",
+    "SETUID",
+    "SETPCAP",
+    "LINUX_IMMUTABLE",
+    "NET_BIND_SERVICE",
+    "NET_BROADCAST",
+    "NET_ADMIN",
+    "NET_RAW",
+    "IPC_LOCK",
+    "IPC_OWNER",
+    "SYS_MODULE",
+    "SYS_RAWIO",
+    "SYS_CHROOT",
+    "SYS_PTRACE",
+    "SYS_PACCT",
+    "SYS_ADMIN",
+    "SYS_BOOT",
+    "SYS_NICE",
+    "SYS_RESOURCE",
+    "SYS_TIME",
+    "SYS_TTY_CONFIG",
+    "MKNOD",
+    "LEASE",
+    "AUDIT_WRITE",
+    "AUDIT_CONTROL",
+    "SETFCAP",
+    "MAC_OVERRIDE",
+    "MAC_ADMIN",
+    "SYSLOG",
+    "WAKE_ALARM",
+    "BLOCK_SUSPEND",
+    "AUDIT_READ",
+    "PERFMON",
+    "BPF",
+    "CHECKPOINT_RESTORE",
 ];
 
 pub fn cap_name_to_bit(name: &str) -> Option<u64> {
@@ -46,6 +81,19 @@ pub fn cap_name_to_bit(name: &str) -> Option<u64> {
 pub struct ChildContext {
     /// Parent writes 'g' when network setup is done, 'e' on failure.
     pub ready_pipe_rd: i32,
+    /// Write end of the exec-notification pipe (-1 disables): the child
+    /// writes one byte immediately before execve so the parent knows the
+    /// process image is in place (Plan Phase 2: closes the start/top race
+    /// where `top`/`ps` briefly show the daemon's cmdline).
+    pub exec_pipe_wr: i32,
+    /// /dev/shm size in bytes (<=0 = 64MiB daemon default).
+    pub shm_size: i64,
+    /// Tmpfs mounts: (absolute dest, mount options).
+    pub tmpfs: Vec<(CString, CString)>,
+    /// Sysctls: (dotted key under `net.`, value); validated at create.
+    pub sysctls: Vec<(CString, CString)>,
+    /// Rlimits: (name, soft, hard); -1 = unlimited; validated at create.
+    pub ulimits: Vec<(CString, i64, i64)>,
     pub stdin_fd: i32,
     pub stdout_fd: i32,
     pub stderr_fd: i32,
@@ -122,26 +170,46 @@ fn child_main(ctx: &ChildContext) -> Result<(), i32> {
     }
 
     // 2. New mount namespace: everything below is private to this container.
-    mount_null("/", None, libc::MS_PRIVATE | libc::MS_REC, None).map_err(|e| fail(e, "remount / private").err().unwrap())?;
+    mount_null("/", None, libc::MS_PRIVATE | libc::MS_REC, None)
+        .map_err(|e| fail(e, "remount / private").err().unwrap())?;
 
     let merged = ctx.merged.to_str().unwrap_or("/");
 
     // 3. Bind /etc files prepared by the daemon.
-    bind_file(ctx.resolv.as_bytes(), format!("{merged}/etc/resolv.conf").as_bytes()).map_err(|e| fail(e, "bind resolv.conf").err().unwrap())?;
-    bind_file(ctx.hosts.as_bytes(), format!("{merged}/etc/hosts").as_bytes()).map_err(|e| fail(e, "bind hosts").err().unwrap())?;
-    bind_file(ctx.hostname_file.as_bytes(), format!("{merged}/etc/hostname").as_bytes()).map_err(|e| fail(e, "bind hostname").err().unwrap())?;
+    bind_file(
+        ctx.resolv.as_bytes(),
+        format!("{merged}/etc/resolv.conf").as_bytes(),
+    )
+    .map_err(|e| fail(e, "bind resolv.conf").err().unwrap())?;
+    bind_file(
+        ctx.hosts.as_bytes(),
+        format!("{merged}/etc/hosts").as_bytes(),
+    )
+    .map_err(|e| fail(e, "bind hosts").err().unwrap())?;
+    bind_file(
+        ctx.hostname_file.as_bytes(),
+        format!("{merged}/etc/hostname").as_bytes(),
+    )
+    .map_err(|e| fail(e, "bind hostname").err().unwrap())?;
 
     // 4. /dev
     let dev = format!("{merged}/dev");
     mkdirs(&dev);
     if ctx.privileged {
-        bind_dir(b"/dev", dev.as_bytes()).map_err(|e| fail(e, "bind /dev (privileged)").err().unwrap())?;
+        bind_dir(b"/dev", dev.as_bytes())
+            .map_err(|e| fail(e, "bind /dev (privileged)").err().unwrap())?;
     } else {
-        mount_tmpfs(&dev, "nr_inodes=1024000,mode=755").map_err(|e| fail(e, "tmpfs /dev").err().unwrap())?;
+        mount_tmpfs(&dev, "nr_inodes=1024000,mode=755")
+            .map_err(|e| fail(e, "tmpfs /dev").err().unwrap())?;
         mkdirs(&format!("{dev}/pts"));
         mkdirs(&format!("{dev}/shm"));
         mount_devpts(&format!("{dev}/pts")).map_err(|e| fail(e, "devpts").err().unwrap())?;
-        mount_tmpfs(&format!("{dev}/shm"), "mode=1777,size=65536k").map_err(|e| fail(e, "shm").err().unwrap())?;
+        let shm_data = if ctx.shm_size > 0 {
+            format!("mode=1777,size={}k", ctx.shm_size.max(1024) / 1024)
+        } else {
+            "mode=1777,size=65536k".to_string()
+        };
+        mount_tmpfs(&format!("{dev}/shm"), &shm_data).map_err(|e| fail(e, "shm").err().unwrap())?;
         for (name, major, minor, mode) in [
             ("null", 1, 3, 0o666u32),
             ("zero", 1, 5, 0o666),
@@ -150,7 +218,8 @@ fn child_main(ctx: &ChildContext) -> Result<(), i32> {
             ("urandom", 1, 9, 0o666),
             ("tty", 5, 0, 0o666),
         ] {
-            mknod(&format!("{dev}/{name}"), libc::S_IFCHR | mode, major, minor).map_err(|e| fail(e, "mknod {name}").err().unwrap())?;
+            mknod(&format!("{dev}/{name}"), libc::S_IFCHR | mode, major, minor)
+                .map_err(|e| fail(e, "mknod {name}").err().unwrap())?;
         }
         // /dev/fd, /dev/stdin, ... → /proc/self/fd
         symlink("/proc/self/fd", &format!("{dev}/fd"));
@@ -162,37 +231,78 @@ fn child_main(ctx: &ChildContext) -> Result<(), i32> {
 
     // 5. /proc, /sys, cgroup
     mkdirs(&format!("{merged}/proc"));
-    mount_fs("proc", &format!("{merged}/proc"), libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV, "").map_err(|e| fail(e, "mount /proc").err().unwrap())?;
+    mount_fs(
+        "proc",
+        &format!("{merged}/proc"),
+        libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
+        "",
+    )
+    .map_err(|e| fail(e, "mount /proc").err().unwrap())?;
     mkdirs(&format!("{merged}/sys"));
-    mount_fs("sysfs", &format!("{merged}/sys"), libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RDONLY, "").map_err(|e| fail(e, "mount /sys").err().unwrap())?;
+    mount_fs(
+        "sysfs",
+        &format!("{merged}/sys"),
+        libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RDONLY,
+        "",
+    )
+    .map_err(|e| fail(e, "mount /sys").err().unwrap())?;
     let cg_dir = format!("{merged}/sys/fs/cgroup");
     mkdirs(&cg_dir);
-    mount_fs("cgroup2", &cg_dir, libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RDONLY, "").map_err(|e| fail(e, "mount cgroup2").err().unwrap())?;
+    mount_fs(
+        "cgroup2",
+        &cg_dir,
+        libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV | libc::MS_RDONLY,
+        "",
+    )
+    .map_err(|e| fail(e, "mount cgroup2").err().unwrap())?;
 
     // 6. Bring loopback up when there is no external net setup (none network).
     if ctx.bring_lo_up {
         lo_up();
     }
 
+    // 6b. Masked paths, first pass (merged-absolute, pre-pivot): the
+    // pre-pivot tree can survive as a shadowed copy when the oldroot
+    // detach is refused, so mask it here too (Plan Phase 3, unit 3.2).
+    // /proc, /sys and /dev/null all exist under merged by this point.
+    mask_paths(merged, "/dev/null");
+
     // 7. pivot_root into the overlay merged dir.
     if unsafe { libc::chdir(ctx.merged.as_ptr()) } != 0 {
         return fail(125, "chdir merged rootfs");
     }
     // Make the new root a mount point (bind to itself), then pivot.
-    mount_null(".", None, libc::MS_BIND | libc::MS_REC, None).map_err(|e| fail(e, "self-bind rootfs").err().unwrap())?;
+    mount_null(".", None, libc::MS_BIND | libc::MS_REC, None)
+        .map_err(|e| fail(e, "self-bind rootfs").err().unwrap())?;
     mkdirs("./oldroot");
-    if unsafe { libc::syscall(libc::SYS_pivot_root, b".\0".as_ptr(), b"./oldroot\0".as_ptr()) } != 0 {
+    if unsafe { libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c"./oldroot".as_ptr()) } != 0 {
         return fail(125, "pivot_root");
     }
-    if unsafe { libc::chdir(b"/\0".as_ptr() as *const libc::c_char) } != 0 {
+    if unsafe { libc::chdir(c"/".as_ptr()) } != 0 {
         return fail(125, "chdir / after pivot");
     }
     umount_detach("/oldroot");
     let _ = rmdir("/oldroot");
 
+    // 7b. Masked paths, second pass (post-pivot, container-absolute):
+    // whichever tree wins path resolution ends up masked.
+    mask_paths("", "/dev/null");
+    // 7c. Tmpfs mounts from HostConfig.Tmpfs.
+    for (dest, opts) in &ctx.tmpfs {
+        let d = dest.to_str().unwrap_or("/");
+        mkdirs(d);
+        let data = opts.to_str().unwrap_or("mode=1777");
+        mount_fs("tmpfs", d, libc::MS_NOSUID | libc::MS_NODEV, data)
+            .map_err(|e| fail(e, "tmpfs mount").err().unwrap())?;
+    }
     if ctx.readonly_rootfs {
-        mount_null("/", None, libc::MS_RDONLY | libc::MS_REMOUNT | libc::MS_BIND | libc::MS_REC, None)
-            .map_err(|e| fail(e, "readonly remount").err().unwrap())?;
+        mount_null(
+            "/",
+            None,
+            libc::MS_RDONLY | libc::MS_REMOUNT | libc::MS_BIND | libc::MS_REC,
+            None,
+        )
+        .map_err(|e| fail(e, "readonly remount").err().unwrap())?;
     }
 
     // 8. Hostname (UTS namespace was created at clone).
@@ -200,8 +310,29 @@ fn child_main(ctx: &ChildContext) -> Result<(), i32> {
         libc::sethostname(ctx.hostname.as_ptr(), ctx.hostname.to_bytes().len());
     }
 
+    // 8b. Sysctls (namespaced net.* only, validated at create).
+    for (key, val) in &ctx.sysctls {
+        let k = key.to_str().unwrap_or("");
+        let path = format!("/proc/sys/{}", k.replace('.', "/"));
+        if std::fs::write(&path, val.to_bytes()).is_err() {
+            return fail(125, "set sysctl");
+        }
+    }
+    // 8c. Rlimits (validated at create; raising hard limits needs the
+    // privilege we still hold here, before any uid switch).
+    for (name, soft, hard) in &ctx.ulimits {
+        if let Err(what) = apply_rlimit(name.to_str().unwrap_or(""), *soft, *hard) {
+            return fail(125, what);
+        }
+    }
+
     // 9. Identity + capabilities.
     let (uid, gid, extra) = resolve_user(ctx);
+    // Fail closed: an explicit User that resolves to nobody must never
+    // silently run as root (Plan Phase 1, unit 1.1b).
+    if uid == u32::MAX && !ctx.user_raw.to_bytes().is_empty() {
+        return fail(126, "unable to find user");
+    }
     apply_caps(ctx)?;
 
     if uid != u32::MAX {
@@ -213,7 +344,14 @@ fn child_main(ctx: &ChildContext) -> Result<(), i32> {
             libc::setresgid(gid as libc::gid_t, gid as libc::gid_t, gid as libc::gid_t);
             libc::setresuid(uid as libc::uid_t, uid as libc::uid_t, uid as libc::uid_t);
         }
-        apply_caps(ctx)?; // re-assert after switching (KEEPcaps preserves permitted)
+        // Re-assert Effective, which the uid switch clears. Permitted
+        // survives via KEEPCAPS and bounding is already final, so a full
+        // re-confine here would fail (no SETPCAP left) — restore Eff only.
+        if let Some(keep) = compute_keep(&ctx.cap_add, &ctx.cap_drop, ctx.privileged) {
+            if !restore_effective(&keep) {
+                return fail(125, "restore effective capabilities");
+            }
+        }
     }
 
     if ctx.no_new_privs {
@@ -251,13 +389,28 @@ fn child_main(ctx: &ChildContext) -> Result<(), i32> {
         .chain(std::iter::once(std::ptr::null()))
         .collect();
     let prog = ctx.argv[0].as_bytes();
+    // Notify the parent that exec is imminent (best effort: the pipe may
+    // already be closed if the parent went away).
+    if ctx.exec_pipe_wr >= 0 {
+        unsafe {
+            libc::write(ctx.exec_pipe_wr, [b'x'].as_ptr() as *const _, 1);
+            libc::close(ctx.exec_pipe_wr);
+        }
+    }
     if prog.contains(&b'/') {
         unsafe {
             libc::execve(ctx.argv[0].as_ptr(), argv.as_ptr(), envp.as_ptr());
         }
         let err = std::io::Error::last_os_error();
         let msg = format!("execve {:?} failed: {err}", ctx.argv[0]);
-        return fail(if err.raw_os_error() == Some(libc::ENOENT) { 127 } else { 126 }, &msg);
+        return fail(
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                127
+            } else {
+                126
+            },
+            &msg,
+        );
     }
     let path_env = ctx
         .envp
@@ -266,7 +419,9 @@ fn child_main(ctx: &ChildContext) -> Result<(), i32> {
             let b = e.to_bytes();
             b.strip_prefix(b"PATH=").map(|p| p.to_vec())
         })
-        .unwrap_or_else(|| b"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_vec());
+        .unwrap_or_else(|| {
+            b"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_vec()
+        });
     let mut last_err = 0u32;
     for dir in path_env.split(|&b| b == b':') {
         let candidate = if dir.is_empty() {
@@ -353,10 +508,18 @@ fn resolve_user(ctx: &ChildContext) -> (u32, u32, Vec<u32>) {
     (uid, gid, extra)
 }
 
-fn apply_caps(ctx: &ChildContext) -> Result<(), i32> {
+/// Effective capability set for a container (Plan Phase 3, unit 3.1).
+/// `None` = privileged: keep everything the daemon has. Shared by the
+/// init path (`apply_caps`) and exec sessions so `docker exec` runs with
+/// the container's caps, not the daemon's.
+pub(crate) fn compute_keep(
+    cap_add: &[String],
+    cap_drop: &[String],
+    privileged: bool,
+) -> Option<std::collections::HashSet<caps::Capability>> {
     use std::str::FromStr;
-    if ctx.privileged {
-        return Ok(()); // keep everything the daemon has
+    if privileged {
+        return None;
     }
     let mut keep: std::collections::HashSet<caps::Capability> = Default::default();
     for name in DEFAULT_CAPS {
@@ -364,7 +527,27 @@ fn apply_caps(ctx: &ChildContext) -> Result<(), i32> {
             keep.insert(c);
         }
     }
-    for name in &ctx.cap_add {
+    // Docker order: start from the default set, drop (ALL empties it),
+    // then add (ALL fills it with everything the daemon holds).
+    for name in cap_drop {
+        if name.eq_ignore_ascii_case("ALL") {
+            keep.clear();
+            continue;
+        }
+        let full = if name.starts_with("CAP_") {
+            name.clone()
+        } else {
+            format!("CAP_{}", name.to_uppercase())
+        };
+        if let Ok(c) = caps::Capability::from_str(&full) {
+            keep.remove(&c);
+        }
+    }
+    for name in cap_add {
+        if name.eq_ignore_ascii_case("ALL") {
+            keep.extend(caps::all());
+            continue;
+        }
         let full = if name.starts_with("CAP_") {
             name.to_uppercase()
         } else {
@@ -374,27 +557,95 @@ fn apply_caps(ctx: &ChildContext) -> Result<(), i32> {
             keep.insert(c);
         }
     }
-    for name in &ctx.cap_drop {
-        let full = if name.starts_with("CAP_") { name.clone() } else { format!("CAP_{}", name.to_uppercase()) };
-        if let Ok(c) = caps::Capability::from_str(&full) {
-            keep.remove(&c);
-        }
-    }
-    for cset in [caps::CapSet::Effective, caps::CapSet::Permitted, caps::CapSet::Inheritable] {
-        if caps::set(None, cset, &keep).is_err() {
-            return Err(125);
-        }
-    }
+    Some(keep)
+}
+
+/// Apply the bounding/effective/permitted/inheritable sets; one-way.
+/// Fail closed: a cap that is present but cannot be dropped aborts setup.
+/// The bounding set goes first because PR_CAPBSET_DROP needs CAP_SETPCAP,
+/// which the Eff/Perm/Inh drops below remove. Caps already absent from the
+/// bounding set are skipped (a present-but-undroppable cap still fails).
+pub(crate) fn confine_caps(keep: &std::collections::HashSet<caps::Capability>) -> bool {
     // Bounding set: drop everything not kept (one-way).
-    for c in caps::all().difference(&keep) {
-        let _ = caps::drop(None, caps::CapSet::Bounding, *c);
+    for c in caps::all().difference(keep) {
+        match caps::has_cap(None, caps::CapSet::Bounding, *c) {
+            Ok(false) => {}
+            Ok(true) => {
+                if caps::drop(None, caps::CapSet::Bounding, *c).is_err() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    for cset in [
+        caps::CapSet::Effective,
+        caps::CapSet::Permitted,
+        caps::CapSet::Inheritable,
+    ] {
+        if caps::set(None, cset, keep).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Re-assert only the Effective set after a uid switch, which clears it.
+/// Permitted survives via KEEPCAPS and the bounding set is already final,
+/// so this needs no privilege beyond holding the caps in Permitted.
+pub(crate) fn restore_effective(keep: &std::collections::HashSet<caps::Capability>) -> bool {
+    caps::set(None, caps::CapSet::Effective, keep).is_ok()
+}
+
+/// Apply one validated ulimit (`-1` = unlimited). Raising a hard limit
+/// needs privilege, so callers run this before dropping capabilities.
+pub(crate) fn apply_rlimit(name: &str, soft: i64, hard: i64) -> Result<(), &'static str> {
+    let resource = match name {
+        "core" => libc::RLIMIT_CORE,
+        "nofile" => libc::RLIMIT_NOFILE,
+        "nproc" => libc::RLIMIT_NPROC,
+        "stack" => libc::RLIMIT_STACK,
+        "as" => libc::RLIMIT_AS,
+        "memlock" => libc::RLIMIT_MEMLOCK,
+        _ => return Err("unknown rlimit"),
+    };
+    let inf = libc::RLIM_INFINITY as i64;
+    let lim = libc::rlimit {
+        rlim_cur: if soft < 0 {
+            inf as libc::rlim_t
+        } else {
+            soft as libc::rlim_t
+        },
+        rlim_max: if hard < 0 {
+            inf as libc::rlim_t
+        } else {
+            hard as libc::rlim_t
+        },
+    };
+    if unsafe { libc::setrlimit(resource, &lim) } != 0 {
+        return Err("setrlimit");
+    }
+    Ok(())
+}
+
+fn apply_caps(ctx: &ChildContext) -> Result<(), i32> {
+    let Some(keep) = compute_keep(&ctx.cap_add, &ctx.cap_drop, ctx.privileged) else {
+        return Ok(()); // privileged: keep everything the daemon has
+    };
+    if !confine_caps(&keep) {
+        return Err(125);
     }
     Ok(())
 }
 
 // ---- thin syscall wrappers returning Result<(), i32> ----
 
-fn mount_null(source: &str, fstype: Option<&str>, flags: u64, data: Option<&str>) -> Result<(), i32> {
+fn mount_null(
+    source: &str,
+    fstype: Option<&str>,
+    flags: u64,
+    data: Option<&str>,
+) -> Result<(), i32> {
     let src = CString::new(source).unwrap();
     let fs = fstype.map(|f| CString::new(f).unwrap());
     let data_c = data.map(|d| CString::new(d).unwrap());
@@ -404,7 +655,10 @@ fn mount_null(source: &str, fstype: Option<&str>, flags: u64, data: Option<&str>
             src.as_ptr(), // target = source for our uses ("/", ".")
             fs.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()),
             flags,
-            data_c.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null()) as *const libc::c_void,
+            data_c
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(std::ptr::null()) as *const libc::c_void,
         )
     };
     (rc == 0).then_some(()).ok_or(125)
@@ -480,6 +734,43 @@ fn mkdirs(path: &str) {
     let _ = std::fs::create_dir_all(path);
 }
 
+/// Hide sensitive kernel interfaces (Plan Phase 3, unit 3.2). `root` is
+/// "" post-pivot (container-absolute paths) or the merged dir pre-pivot;
+/// `null` is a /dev/null visible from that tree. Best effort per path:
+/// slim images may lack them, and masking must never fail a start.
+fn mask_paths(root: &str, null: &str) {
+    // Files → bind /dev/null over them.
+    for p in [
+        "/proc/asound",
+        "/proc/acpi",
+        "/proc/kcore",
+        "/proc/keys",
+        "/proc/timer_list",
+        "/proc/timer_stats",
+        "/proc/sched_debug",
+        "/proc/scsi",
+        "/sys/firmware",
+    ] {
+        let t = format!("{root}{p}");
+        if std::path::Path::new(&t).is_file() {
+            let _ = bind_file(null.as_bytes(), t.as_bytes());
+        }
+    }
+    // Directories → empty read-only tmpfs over them (mount rw first:
+    // a fresh tmpfs mount rejects MS_RDONLY, so remount read-only after).
+    for p in ["/sys/fs/selinux", "/proc/scsi", "/sys/firmware"] {
+        let t = format!("{root}{p}");
+        if std::path::Path::new(&t).is_dir() && mount_tmpfs(&t, "mode=555").is_ok() {
+            let _ = mount_null(
+                &t,
+                None,
+                libc::MS_RDONLY | libc::MS_REMOUNT | libc::MS_BIND,
+                None,
+            );
+        }
+    }
+}
+
 fn mknod(path: &str, mode: u32, major: u32, minor: u32) -> Result<(), i32> {
     use std::os::unix::ffi::OsStrExt;
     let p = std::path::Path::new(path);
@@ -512,7 +803,7 @@ fn rmdir(path: &str) -> Result<(), i32> {
 /// Bring loopback up inside a fresh netns (used when there is no veth setup).
 fn lo_up() {
     // ioctl SIOCSIFFLAGS on a raw socket — minimal netlink-free path.
-    use std::os::unix::io::AsRawFd;
+
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return;
@@ -520,7 +811,11 @@ fn lo_up() {
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     let name = b"lo\0";
     unsafe {
-        std::ptr::copy_nonoverlapping(name.as_ptr(), ifr.ifr_name.as_mut_ptr() as *mut u8, name.len());
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            ifr.ifr_name.as_mut_ptr() as *mut u8,
+            name.len(),
+        );
         let sock = fd;
         // Read current flags
         if libc::ioctl(sock, libc::SIOCGIFFLAGS, &mut ifr) == 0 {
@@ -532,3 +827,62 @@ fn lo_up() {
     let _ = fd;
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn stays(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn keep_defaults_when_empty() {
+        let keep = compute_keep(&[], &[], false).unwrap();
+        assert_eq!(keep.len(), DEFAULT_CAPS.len());
+        assert!(keep.contains(&caps::Capability::from_str("CAP_CHOWN").unwrap()));
+    }
+
+    #[test]
+    fn keep_drop_all_empties() {
+        let keep = compute_keep(&[], &stays(&["ALL"]), false).unwrap();
+        assert!(keep.is_empty());
+    }
+
+    #[test]
+    fn keep_drop_all_then_add() {
+        let keep = compute_keep(&stays(&["CHOWN"]), &stays(&["ALL"]), false).unwrap();
+        assert_eq!(keep.len(), 1);
+        assert!(keep.contains(&caps::Capability::from_str("CAP_CHOWN").unwrap()));
+    }
+
+    #[test]
+    fn keep_drop_single() {
+        let keep = compute_keep(&[], &stays(&["CHOWN"]), false).unwrap();
+        assert_eq!(keep.len(), DEFAULT_CAPS.len() - 1);
+        assert!(!keep.contains(&caps::Capability::from_str("CAP_CHOWN").unwrap()));
+    }
+
+    #[test]
+    fn keep_privileged_skips() {
+        assert!(compute_keep(&[], &stays(&["ALL"]), true).is_none());
+    }
+
+    #[test]
+    fn rlimit_unknown_name_fails() {
+        assert_eq!(apply_rlimit("rtprio", 0, 0), Err("unknown rlimit"));
+    }
+
+    #[test]
+    fn rlimit_lower_nofile_succeeds_unprivileged() {
+        // Lowering is always permitted; keep values tiny and restore after.
+        let (soft, hard) = unsafe {
+            let mut lim = std::mem::zeroed::<libc::rlimit>();
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim);
+            (lim.rlim_cur, lim.rlim_max)
+        };
+        let small = 64.min(soft) as i64;
+        assert!(apply_rlimit("nofile", small, hard as i64).is_ok());
+        assert!(apply_rlimit("nofile", soft as i64, hard as i64).is_ok());
+    }
+}

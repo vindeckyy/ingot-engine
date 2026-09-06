@@ -40,6 +40,44 @@ pub struct DaemonState {
     pub networks: Option<Arc<ingot_network::NetworkManager>>,
     /// Volume manager (M5).
     pub volumes: Option<Arc<ingot_volume::VolumeManager>>,
+    /// Build secrets staged via POST /secrets: token → values. Memory
+    /// only, single-use (taken by the build that presents the token),
+    /// swept after an hour. Values here never touch disk, logs, or
+    /// layer/cache accounting.
+    pub build_secrets: tokio::sync::Mutex<BuildSecretStore>,
+}
+
+#[derive(Default)]
+pub struct BuildSecretStore {
+    entries: std::collections::HashMap<String, BuildSecretBundle>,
+}
+
+pub struct BuildSecretBundle {
+    pub created: std::time::Instant,
+    pub values: std::collections::HashMap<String, String>,
+}
+
+impl BuildSecretStore {
+    /// Stash values, returning a one-time token. Sweeps entries older
+    /// than an hour so unused tokens cannot accumulate.
+    pub fn insert(&mut self, values: std::collections::HashMap<String, String>) -> String {
+        self.entries
+            .retain(|_, b| b.created.elapsed() < std::time::Duration::from_secs(3600));
+        let token = ingot_util::random_token();
+        self.entries.insert(
+            token.clone(),
+            BuildSecretBundle {
+                created: std::time::Instant::now(),
+                values,
+            },
+        );
+        token
+    }
+
+    /// Take (and thereby invalidate) one token's values.
+    pub fn take(&mut self, token: &str) -> Option<std::collections::HashMap<String, String>> {
+        self.entries.remove(token).map(|b| b.values)
+    }
 }
 
 pub type SharedState = Arc<DaemonState>;
@@ -58,6 +96,7 @@ impl DaemonState {
             containers: None,
             networks: None,
             volumes: None,
+            build_secrets: tokio::sync::Mutex::new(BuildSecretStore::default()),
         })
     }
 }

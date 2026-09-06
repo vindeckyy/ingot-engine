@@ -7,11 +7,7 @@ use std::path::Path;
 /// Mount overlayfs for a container: image layers as lowerdirs, container
 /// diff/work dirs as upper/work. Mounted in the daemon's mount namespace —
 /// the container child inherits it via clone(CLONE_NEWNS).
-pub fn mount_rootfs(
-    paths: &DataPaths,
-    container_id: &str,
-    diff_ids: &[String],
-) -> Result<()> {
+pub fn mount_rootfs(paths: &DataPaths, container_id: &str, diff_ids: &[String]) -> Result<()> {
     for sub in ["diff", "work", "merged"] {
         std::fs::create_dir_all(paths.overlay_container(container_id).join(sub))?;
     }

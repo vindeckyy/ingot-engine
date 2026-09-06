@@ -70,7 +70,9 @@ impl<R: Read> Read for HashingReader<R> {
 }
 
 fn safe_join(root: &Path, entry_path: &str) -> Result<PathBuf> {
-    clean_rel(entry_path)?.map(|rel| root.join(rel)).ok_or_else(|| anyhow!("empty entry path"))
+    clean_rel(entry_path)?
+        .map(|rel| root.join(rel))
+        .ok_or_else(|| anyhow!("empty entry path"))
 }
 
 /// Sanitized relative path; None for entries that denote the root itself
@@ -85,7 +87,11 @@ fn clean_rel(entry_path: &str) -> Result<Option<PathBuf>> {
             Component::ParentDir => return Err(anyhow!("layer entry escapes root: {entry_path}")),
         }
     }
-    Ok(if clean.as_os_str().is_empty() { None } else { Some(clean) })
+    Ok(if clean.as_os_str().is_empty() {
+        None
+    } else {
+        Some(clean)
+    })
 }
 
 /// Header fields we need, owned (so `entry` is free for streaming reads).
@@ -135,7 +141,9 @@ fn unpack_entries<R: Read>(archive: &mut tar::Archive<R>, root: &Path) -> Result
         }
         if let Some(target) = base_name.strip_prefix(".wh.") {
             let target = target.to_string();
-            let parent = full.parent().ok_or_else(|| anyhow!("whiteout without parent"))?;
+            let parent = full
+                .parent()
+                .ok_or_else(|| anyhow!("whiteout without parent"))?;
             std::fs::create_dir_all(parent)?;
             // Char device 0:0 = overlayfs whiteout marker.
             let _ = std::fs::remove_file(parent.join(&target));
@@ -208,10 +216,17 @@ fn unpack_entries<R: Read>(archive: &mut tar::Archive<R>, root: &Path) -> Result
 
 /// Device major/minor, zeroed for non-device entries.
 fn read_dev(header: &tar::Header, major: bool) -> u32 {
-    if !matches!(header.entry_type(), tar::EntryType::Char | tar::EntryType::Block) {
+    if !matches!(
+        header.entry_type(),
+        tar::EntryType::Char | tar::EntryType::Block
+    ) {
         return 0;
     }
-    let v = if major { header.device_major() } else { header.device_minor() };
+    let v = if major {
+        header.device_major()
+    } else {
+        header.device_minor()
+    };
     v.ok().flatten().unwrap_or(0)
 }
 
@@ -278,12 +293,12 @@ fn create_special(path: &Path, info: &EntryInfo) -> Result<()> {
 fn set_opaque(dir: &Path) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
-    for name in ["trusted.overlay.opaque", "user.overlay.opaque"] {
+    for name in [c"trusted.overlay.opaque", c"user.overlay.opaque"] {
         let rc = unsafe {
             libc::setxattr(
                 c.as_ptr(),
-                name.as_ptr() as *const libc::c_char,
-                b"y\0".as_ptr() as *const libc::c_void,
+                name.as_ptr(),
+                c"y".as_ptr() as *const libc::c_void,
                 2,
                 0,
             )

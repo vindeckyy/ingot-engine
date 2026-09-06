@@ -35,11 +35,14 @@ pub struct Dockerfile {
 impl Dockerfile {
     /// First FROM's base image.
     pub fn base_image(&self) -> Option<&str> {
-        self.instructions.iter().find(|i| i.verb == "FROM").map(|i| {
-            // FROM <image> [AS name] — skip flags
-            let words: Vec<&str> = i.args.split_whitespace().collect();
-            words.first().copied().unwrap_or("")
-        })
+        self.instructions
+            .iter()
+            .find(|i| i.verb == "FROM")
+            .map(|i| {
+                // FROM <image> [AS name] — skip flags
+                let words: Vec<&str> = i.args.split_whitespace().collect();
+                words.first().copied().unwrap_or("")
+            })
     }
 
     /// Resolve ARG defaults for expansion.
@@ -133,8 +136,16 @@ pub fn parse(content: &str) -> Result<Dockerfile> {
     if instructions.is_empty() {
         return Err(anyhow!("the Dockerfile contains no instructions"));
     }
-    if instructions.first().map(|i| i.verb.clone()) != Some("FROM".into()) {
-        return Err(anyhow!("Dockerfile must begin with FROM"));
+    // Only ARG may precede the first FROM (global build args); anything
+    // else there is a malformed Dockerfile.
+    let first_from = instructions.iter().position(|i| i.verb == "FROM");
+    match first_from {
+        None => return Err(anyhow!("Dockerfile contains no FROM instruction")),
+        Some(pos) => {
+            if instructions[..pos].iter().any(|i| i.verb != "ARG") {
+                return Err(anyhow!("Dockerfile must begin with FROM"));
+            }
+        }
     }
     Ok(Dockerfile { instructions })
 }
@@ -226,16 +237,18 @@ fn split_heredocs(text: &str) -> (String, Vec<Heredoc>) {
         let mut remaining: Vec<&str> = body;
         for delim in &delims {
             let mut content = Vec::new();
-            let mut target = String::new();
-            loop {
-                let Some(l) = remaining.first().copied() else { break };
+            let target = String::new();
+            while let Some(l) = remaining.first().copied() {
                 remaining.remove(0);
                 if l.trim_end() == delim.as_str() {
                     break;
                 }
                 content.push(l.to_string());
             }
-            heredocs.push(Heredoc { target, content: content.join("\n") });
+            heredocs.push(Heredoc {
+                target,
+                content: content.join("\n"),
+            });
             let _ = target;
         }
     }
@@ -250,7 +263,9 @@ fn split_flags(args: &str) -> (Vec<(String, String)>, String) {
         if !rest.starts_with("--") {
             break;
         }
-        let Some(space) = rest.find(char::is_whitespace) else { break };
+        let Some(space) = rest.find(char::is_whitespace) else {
+            break;
+        };
         let tok = rest[..space].to_string();
         rest = rest[space..].trim().to_string();
         if let Some((k, v)) = tok[2..].split_once('=') {
@@ -288,9 +303,8 @@ pub fn expand_vars(input: &str, env: &[(String, String)]) -> String {
                         None => (name.clone(), None),
                     };
                     let val = env.iter().find(|(k, _)| *k == var).map(|(_, v)| v.clone());
-                    match val.or(default) {
-                        Some(v) => out.push_str(&v),
-                        None => {}
+                    if let Some(v) = val.or(default) {
+                        out.push_str(&v)
                     }
                     i += 2 + close + 1;
                     continue;
@@ -320,11 +334,24 @@ mod tests {
 
     #[test]
     fn parses_basic_dockerfile() {
-        let df = parse("FROM busybox\n\n# comment\nRUN echo one \\\n  && echo two\nCMD [\"echo\",\"hi\"]").unwrap();
+        let df = parse(
+            "FROM busybox\n\n# comment\nRUN echo one \\\n  && echo two\nCMD [\"echo\",\"hi\"]",
+        )
+        .unwrap();
         assert_eq!(df.instructions.len(), 3);
         assert_eq!(df.instructions[1].verb, "RUN");
-        assert_eq!(df.instructions[1].args.trim().split_whitespace().collect::<Vec<_>>().join(" "), "echo one && echo two");
-        assert_eq!(df.instructions[2].json_args.as_deref(), Some(&["echo".to_string(), "hi".to_string()][..]));
+        assert_eq!(
+            df.instructions[1]
+                .args
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            "echo one && echo two"
+        );
+        assert_eq!(
+            df.instructions[2].json_args.as_deref(),
+            Some(&["echo".to_string(), "hi".to_string()][..])
+        );
     }
 
     #[test]
@@ -334,6 +361,24 @@ mod tests {
         assert_eq!(i.flags[0], ("from".into(), "x".into()));
         assert_eq!(i.flags[1], ("chown".into(), "1:1".into()));
         assert_eq!(i.args, "a b");
+    }
+
+    #[test]
+    fn leading_arg_before_from_is_global() {
+        let df = parse("ARG VER=1.0\nFROM busybox\nARG VER\nRUN echo $VER").unwrap();
+        assert_eq!(df.instructions.len(), 4);
+        assert_eq!(df.instructions[0].verb, "ARG");
+        assert_eq!(
+            df.arg_defaults(),
+            vec![("VER".to_string(), "1.0".to_string())]
+        );
+    }
+
+    #[test]
+    fn non_arg_before_from_rejected() {
+        assert!(parse("RUN echo early\nFROM busybox").is_err());
+        assert!(parse("FROM busybox").is_ok());
+        assert!(parse("ARG X=1\nARG Y\nFROM busybox").is_ok());
     }
 
     #[test]

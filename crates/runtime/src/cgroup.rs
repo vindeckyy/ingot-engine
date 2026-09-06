@@ -41,7 +41,11 @@ impl Cgroup {
         if nano_cpus > 0 {
             // nano_cpus → "max $quota $period" (period 100ms)
             let quota = nano_cpus / 100_000; // per 100ms
-            let val = if quota >= 100_000_000 { "max 100000".to_string() } else { format!("{quota} 100000") };
+            let val = if quota >= 100_000_000 {
+                "max 100000".to_string()
+            } else {
+                format!("{quota} 100000")
+            };
             write(&self.dir, "cpu.max", &val)?;
         } else if cpu_shares > 0 {
             let weight = shares_to_weight(cpu_shares);
@@ -104,6 +108,17 @@ impl Cgroup {
         parse_first_u64(&self.dir.join("pids.current"))
     }
 
+    /// Cumulative OOM kills for this cgroup (Plan Phase 2, unit 2.5).
+    /// Read at container start as a baseline and again at exit: a SIGKILL
+    /// exit with an incremented counter is a real OOM kill, while a manual
+    /// `kill -9` or stop-escalation leaves the counter flat.
+    pub fn oom_kills(&self) -> u64 {
+        std::fs::read_to_string(self.dir.join("memory.events"))
+            .ok()
+            .and_then(|s| parse_oom_kills(&s))
+            .unwrap_or(0)
+    }
+
     pub fn exists(&self) -> bool {
         self.dir.exists()
     }
@@ -114,6 +129,13 @@ fn parse_first_u64(p: &Path) -> u64 {
         .ok()
         .and_then(|s| s.lines().next().and_then(|l| l.trim().parse().ok()))
         .unwrap_or(0)
+}
+
+fn parse_oom_kills(events: &str) -> Option<u64> {
+    events.lines().find_map(|l| {
+        l.strip_prefix("oom_kill ")
+            .and_then(|v| v.trim().parse().ok())
+    })
 }
 
 fn enable_controllers(dir: &Path) -> Result<()> {
@@ -132,8 +154,7 @@ fn enable_controllers(dir: &Path) -> Result<()> {
 }
 
 fn write(dir: &Path, file: &str, val: &str) -> Result<()> {
-    std::fs::write(dir.join(file), val)
-        .map_err(|e| anyhow!("write {file}={val}: {e}"))
+    std::fs::write(dir.join(file), val).map_err(|e| anyhow!("write {file}={val}: {e}"))
 }
 
 /// docker --cpu-shares 1024..262144 → cgroup v2 weight 1..10000.
@@ -155,5 +176,13 @@ mod tests {
         assert_eq!(shares_to_weight(0), 100);
         assert!(shares_to_weight(1024) > 1 && shares_to_weight(1024) < 300);
         assert!(shares_to_weight(262144) <= 10000);
+    }
+
+    #[test]
+    fn oom_kill_parsing() {
+        let sample = "low 0\nhigh 0\nmax 0\noom 3\noom_kill 2\noom_group_kill 0\n";
+        assert_eq!(parse_oom_kills(sample), Some(2));
+        assert_eq!(parse_oom_kills("low 0\nhigh 0\n"), None);
+        assert_eq!(parse_oom_kills(""), None);
     }
 }

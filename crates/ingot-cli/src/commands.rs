@@ -5,15 +5,14 @@ use crate::RunOpts;
 use anyhow::{anyhow, Result};
 use http_body_util::BodyExt;
 
-pub fn not_ready(what: &str) -> Result<()> {
-    println!("`ingot {what}` lands in an upcoming milestone — daemon must be at M2");
-    Ok(())
-}
-
 pub async fn version(api: &ApiClient) -> Result<()> {
     println!("Client:");
     println!("  Version:   {}", env!("CARGO_PKG_VERSION"));
-    println!("  OS/Arch:   {}/{}", std::env::consts::OS, std::env::consts::ARCH);
+    println!(
+        "  OS/Arch:   {}/{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
     println!();
     let v = api.get_json::<serde_json::Value>("/version").await?;
     println!("Server: {}", api.socket.display());
@@ -29,7 +28,10 @@ pub async fn version(api: &ApiClient) -> Result<()> {
         v["Os"].as_str().unwrap_or("?"),
         v["Arch"].as_str().unwrap_or("?")
     );
-    println!("  Kernel:    {}", v["KernelVersion"].as_str().unwrap_or("?"));
+    println!(
+        "  Kernel:    {}",
+        v["KernelVersion"].as_str().unwrap_or("?")
+    );
     Ok(())
 }
 
@@ -37,13 +39,28 @@ pub async fn info(api: &ApiClient) -> Result<()> {
     let v = api.get_json::<serde_json::Value>("/info").await?;
     println!("Containers: {}", v["Containers"].as_i64().unwrap_or(0));
     println!(" Images:    {}", v["Images"].as_i64().unwrap_or(0));
-    println!("Server Version: {}", v["ServerVersion"].as_str().unwrap_or("?"));
+    println!(
+        "Server Version: {}",
+        v["ServerVersion"].as_str().unwrap_or("?")
+    );
     println!("Storage Driver: {}", v["Driver"].as_str().unwrap_or("?"));
-    println!("Cgroup Version: {}", v["CgroupVersion"].as_str().unwrap_or("?"));
-    println!("Operating System: {}", v["OperatingSystem"].as_str().unwrap_or("?"));
-    println!("Kernel Version: {}", v["KernelVersion"].as_str().unwrap_or("?"));
+    println!(
+        "Cgroup Version: {}",
+        v["CgroupVersion"].as_str().unwrap_or("?")
+    );
+    println!(
+        "Operating System: {}",
+        v["OperatingSystem"].as_str().unwrap_or("?")
+    );
+    println!(
+        "Kernel Version: {}",
+        v["KernelVersion"].as_str().unwrap_or("?")
+    );
     println!("NCPU: {}", v["NCPU"].as_i64().unwrap_or(0));
-    println!("MemTotal: {} MB", v["MemTotal"].as_i64().unwrap_or(0) / 1024 / 1024);
+    println!(
+        "MemTotal: {} MB",
+        v["MemTotal"].as_i64().unwrap_or(0) / 1024 / 1024
+    );
     Ok(())
 }
 
@@ -71,17 +88,59 @@ fn human_size(bytes: i64) -> String {
     }
 }
 
-pub async fn ps(api: &ApiClient, all: bool) -> Result<()> {
-    let list: Vec<serde_json::Value> =
-        api.get_json(&format!("/containers/json?all={}", if all { 1 } else { 0 })).await?;
+pub async fn ps(
+    api: &ApiClient,
+    all: bool,
+    quiet: bool,
+    no_trunc: bool,
+    filters: &[String],
+) -> Result<()> {
+    let mut url = format!("/containers/json?all={}", if all { 1 } else { 0 });
+    if !filters.is_empty() {
+        let map: serde_json::Map<String, serde_json::Value> = filters
+            .iter()
+            .filter_map(|f| {
+                let (k, v) = f.split_once('=')?;
+                Some((
+                    k.to_string(),
+                    serde_json::Value::Array(vec![serde_json::json!(v)]),
+                ))
+            })
+            .collect();
+        url.push_str(&format!(
+            "&filters={}",
+            url_escape(&serde_json::to_string(&map)?)
+        ));
+    }
+    let list: Vec<serde_json::Value> = api.get_json(&url).await?;
+    if quiet {
+        for c in &list {
+            let id = c["Id"].as_str().unwrap_or("");
+            println!(
+                "{}",
+                if no_trunc {
+                    id
+                } else {
+                    &id[..12.min(id.len())]
+                }
+            );
+        }
+        return Ok(());
+    }
     println!(
-        "{:<14} {:<16} {:<24} {:<12} {:<16} {}",
-        "CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "NAMES"
+        "{:<14} {:<16} {:<24} {:<12} {:<16} NAMES",
+        "CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS"
     );
     for c in &list {
+        let id = c["Id"].as_str().unwrap_or("");
+        let id_str = if no_trunc {
+            id.to_string()
+        } else {
+            id.chars().take(12).collect::<String>()
+        };
         println!(
             "{:<14} {:<16} {:<24} {:<12} {:<16} {}",
-            c["Id"].as_str().unwrap_or("").chars().take(12).collect::<String>(),
+            id_str,
             c["Image"].as_str().unwrap_or(""),
             truncate(c["Command"].as_str().unwrap_or(""), 22),
             human_created(c["Created"].as_i64().unwrap_or(0)),
@@ -100,11 +159,50 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-pub async fn images(api: &ApiClient) -> Result<()> {
-    let list: Vec<serde_json::Value> = api.get_json("/images/json").await?;
+pub async fn images(
+    api: &ApiClient,
+    quiet: bool,
+    no_trunc: bool,
+    filters: &[String],
+) -> Result<()> {
+    let mut url = "/images/json".to_string();
+    if !filters.is_empty() {
+        let map: serde_json::Map<String, serde_json::Value> = filters
+            .iter()
+            .filter_map(|f| {
+                let (k, v) = f.split_once('=')?;
+                Some((
+                    k.to_string(),
+                    serde_json::Value::Array(vec![serde_json::json!(v)]),
+                ))
+            })
+            .collect();
+        url.push_str(&format!(
+            "?filters={}",
+            url_escape(&serde_json::to_string(&map)?)
+        ));
+    }
+    let list: Vec<serde_json::Value> = api.get_json(&url).await?;
+    if quiet {
+        for img in &list {
+            let id = img["Id"]
+                .as_str()
+                .unwrap_or("")
+                .trim_start_matches("sha256:");
+            println!(
+                "{}",
+                if no_trunc {
+                    id
+                } else {
+                    &id[..12.min(id.len())]
+                }
+            );
+        }
+        return Ok(());
+    }
     println!(
-        "{:<20} {:<10} {:<16} {:<20} {}",
-        "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"
+        "{:<20} {:<10} {:<16} {:<20} SIZE",
+        "REPOSITORY", "TAG", "IMAGE ID", "CREATED"
     );
     for img in &list {
         let (repo, tag) = img["RepoTags"][0]
@@ -115,11 +213,20 @@ pub async fn images(api: &ApiClient) -> Result<()> {
                     .unwrap_or((t.to_string(), "latest".into()))
             })
             .unwrap_or(("<none>".into(), "<none>".into()));
+        let id = img["Id"]
+            .as_str()
+            .unwrap_or("")
+            .trim_start_matches("sha256:");
+        let id_str = if no_trunc {
+            id.to_string()
+        } else {
+            id.chars().take(12).collect::<String>()
+        };
         println!(
             "{:<20} {:<10} {:<16} {:<20} {}",
             repo,
             tag,
-            img["Id"].as_str().unwrap_or("").trim_start_matches("sha256:").chars().take(12).collect::<String>(),
+            id_str,
             human_created(img["Created"].as_i64().unwrap_or(0)),
             human_size(img["Size"].as_i64().unwrap_or(0)),
         );
@@ -127,18 +234,69 @@ pub async fn images(api: &ApiClient) -> Result<()> {
     Ok(())
 }
 
+/// Store registry credentials locally (client-side, like `docker login`;
+/// validated on the next authenticated pull).
+pub async fn login(
+    server: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    password_stdin: bool,
+) -> Result<()> {
+    let username = match username {
+        Some(u) => u.to_string(),
+        None => {
+            eprint!("Username: ");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)?;
+            line.trim_end_matches(['\r', '\n']).to_string()
+        }
+    };
+    let password = if password_stdin {
+        let mut all = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut all)?;
+        all.trim_end_matches(['\r', '\n']).to_string()
+    } else {
+        match password {
+            Some(p) => p.to_string(),
+            None => crate::auth::read_password("Password: ")?,
+        }
+    };
+    crate::auth::store(server, &username, &password)?;
+    println!("Login Succeeded");
+    Ok(())
+}
+
+/// Drop stored registry credentials.
+pub async fn logout(server: &str) -> Result<()> {
+    if crate::auth::remove(server)? {
+        println!("Removing login credentials for {server}");
+    } else {
+        println!("Not logged in to {server}");
+    }
+    Ok(())
+}
+
 /// POST /images/create and print the docker-style progress stream.
-pub async fn pull(api: &ApiClient, image: &str) -> Result<()> {
+pub async fn pull(api: &ApiClient, image: &str, platform: Option<&str>) -> Result<()> {
     let (repo, tag) = match image.split_once(':') {
         Some((r, t)) => (r, t),
         None => (image, "latest"),
     };
+    let mut url = format!("/images/create?fromImage={repo}&tag={tag}");
+    if let Some(p) = platform {
+        url.push_str("&platform=");
+        url.push_str(p);
+    }
+    let mut headers: Vec<(&str, String)> = Vec::new();
+    let auth_value;
+    if let Some(a) = crate::auth::auth_header_for_image(image)? {
+        auth_value = a;
+        headers.push(("X-Registry-Auth", auth_value.clone()));
+    }
+    let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let resp = api
-        .request(
-            "POST",
-            &format!("/images/create?fromImage={repo}&tag={tag}"),
-            None,
-        )
+        .request_with_headers("POST", &url, None, &header_refs)
         .await?;
     let mut had_error = false;
     crate::client::stream_lines(resp, |v| {
@@ -168,23 +326,18 @@ pub async fn pull(api: &ApiClient, image: &str) -> Result<()> {
 pub async fn run(api: &ApiClient, opts: &RunOpts, image: &str, cmd: Vec<String>) -> Result<()> {
     let mut port_bindings = serde_json::Map::new();
     for p in &opts.publish {
-        // host:container[/proto] or container[/proto]
-        let (host_part, rest) = match p.split_once(':') {
-            Some((h, r)) => (Some(h), r),
-            None => (None, p.as_str()),
-        };
-        let (cport, proto) = rest.split_once('/').unwrap_or((rest, "tcp"));
-        let key = format!("{cport}/{proto}");
-        let binding = serde_json::json!({
-            "HostIp": host_part.unwrap_or(""),
-            "HostPort": host_part.unwrap_or(""),
-        });
-        port_bindings
-            .entry(key)
-            .or_insert_with(|| serde_json::Value::Array(vec![]))
-            .as_array_mut()
-            .unwrap()
-            .push(binding);
+        for m in crate::ports::parse_port_spec(p).map_err(|e| anyhow::anyhow!("{e}"))? {
+            let binding = serde_json::json!({
+                "HostIp": m.host_ip,
+                "HostPort": m.host_port,
+            });
+            port_bindings
+                .entry(m.container_key)
+                .or_insert_with(|| serde_json::Value::Array(vec![]))
+                .as_array_mut()
+                .unwrap()
+                .push(binding);
+        }
     }
     let body = serde_json::json!({
         "Image": image,
@@ -198,6 +351,9 @@ pub async fn run(api: &ApiClient, opts: &RunOpts, image: &str, cmd: Vec<String>)
             "Binds": opts.volume,
             "NetworkMode": opts.network,
             "PortBindings": port_bindings,
+            "Dns": opts.dns,
+            "DnsSearch": opts.dns_search,
+            "DnsOptions": opts.dns_opt,
         },
     });
     let q = match &opts.name {
@@ -205,15 +361,24 @@ pub async fn run(api: &ApiClient, opts: &RunOpts, image: &str, cmd: Vec<String>)
         None => String::new(),
     };
     let created = api
-        .request_json("POST", &format!("/containers/create{q}"), Some(serde_json::to_vec(&body)?))
+        .request_json(
+            "POST",
+            &format!("/containers/create{q}"),
+            Some(serde_json::to_vec(&body)?),
+        )
         .await?;
     let id = created["Id"]
         .as_str()
         .ok_or_else(|| anyhow!("create failed"))?
         .to_string();
 
-    if let Err(e) = api.request_raw("POST", &format!("/containers/{id}/start"), None).await {
-        let _ = api.request_raw("DELETE", &format!("/containers/{id}?force=1"), None).await;
+    if let Err(e) = api
+        .request_raw("POST", &format!("/containers/{id}/start"), None)
+        .await
+    {
+        let _ = api
+            .request_raw("DELETE", &format!("/containers/{id}?force=1"), None)
+            .await;
         return Err(e);
     }
 
@@ -223,7 +388,7 @@ pub async fn run(api: &ApiClient, opts: &RunOpts, image: &str, cmd: Vec<String>)
     }
 
     // Follow the framed log stream concurrently; exit when the container does.
-    let mut resp = api
+    let resp = api
         .request(
             "GET",
             &format!("/containers/{id}/logs?stdout=1&stderr=1&follow=1&tail=all"),
@@ -244,7 +409,8 @@ pub async fn run(api: &ApiClient, opts: &RunOpts, image: &str, cmd: Vec<String>)
                 Some(Err(_)) | None => break,
             }
             while pending.len() >= 8 && multiplexed {
-                let len = u32::from_be_bytes([pending[4], pending[5], pending[6], pending[7]]) as usize;
+                let len =
+                    u32::from_be_bytes([pending[4], pending[5], pending[6], pending[7]]) as usize;
                 if pending.len() < 8 + len {
                     break;
                 }
@@ -270,21 +436,25 @@ pub async fn run(api: &ApiClient, opts: &RunOpts, image: &str, cmd: Vec<String>)
 
 pub async fn stop(api: &ApiClient, containers: &[String]) -> Result<()> {
     for c in containers {
-        let _ = api.request_raw("POST", &format!("/containers/{c}/stop"), None).await?;
+        let _ = api
+            .request_raw("POST", &format!("/containers/{c}/stop"), None)
+            .await?;
         println!("{c}");
     }
     Ok(())
 }
 
 pub async fn kill(api: &ApiClient, container: &str) -> Result<()> {
-    api.request_raw("POST", &format!("/containers/{container}/kill"), None).await?;
+    api.request_raw("POST", &format!("/containers/{container}/kill"), None)
+        .await?;
     Ok(())
 }
 
 pub async fn rm(api: &ApiClient, force: bool, containers: &[String]) -> Result<()> {
     for c in containers {
         let suffix = if force { "?force=1" } else { "" };
-        api.request_raw("DELETE", &format!("/containers/{c}{suffix}"), None).await?;
+        api.request_raw("DELETE", &format!("/containers/{c}{suffix}"), None)
+            .await?;
         println!("{c}");
     }
     Ok(())
@@ -298,7 +468,7 @@ pub async fn logs(
 ) -> Result<()> {
     let f = if follow { 1 } else { 0 };
     let tail = tail.unwrap_or_else(|| "all".into());
-    let mut resp = api
+    let resp = api
         .request(
             "GET",
             &format!("/containers/{container}/logs?stdout=1&stderr=1&follow={f}&tail={tail}"),
@@ -357,7 +527,10 @@ pub async fn exec(api: &ApiClient, container: &str, cmd: Vec<String>) -> Result<
             })),
         )
         .await?;
-    let eid = created["Id"].as_str().ok_or_else(|| anyhow!("no exec id"))?.to_string();
+    let eid = created["Id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("no exec id"))?
+        .to_string();
     // Hijacked start would need raw duplex; for M2 use the logs-less variant:
     // start detached then report exit via inspect polling.
     api.post::<serde_json::Value>(
@@ -365,14 +538,12 @@ pub async fn exec(api: &ApiClient, container: &str, cmd: Vec<String>) -> Result<
         Some(serde_json::json!({"Detach": false, "Tty": false})),
     )
     .await
-    .or_else(|e| {
-        // The hijacked response cannot be parsed as JSON — expected.
-        Err(e)
-    })
     .ok();
     // Poll exec inspect for exit code.
     loop {
-        let insp = api.get_json::<serde_json::Value>(&format!("/exec/{eid}/json")).await?;
+        let insp = api
+            .get_json::<serde_json::Value>(&format!("/exec/{eid}/json"))
+            .await?;
         let running = insp["Running"].as_bool().unwrap_or(false);
         if !running {
             let code = insp["ExitCode"].as_i64().unwrap_or(0);
@@ -383,11 +554,46 @@ pub async fn exec(api: &ApiClient, container: &str, cmd: Vec<String>) -> Result<
 }
 
 /// Tar the build context (honouring .dockerignore) and stream /build.
+/// Parse one `--secret id=name,src=path|env=VAR` spec into its id and
+/// value. Values are read here, on the client, and travel to the daemon
+/// once inside the POST /secrets body — never on a command line or URL.
+pub fn parse_secret_spec(spec: &str) -> Result<(String, String)> {
+    let mut id: Option<String> = None;
+    let mut src: Option<String> = None;
+    let mut env: Option<String> = None;
+    for part in spec.split(',') {
+        let (k, v) = part
+            .split_once('=')
+            .ok_or_else(|| anyhow!("bad --secret {spec:?} (want id=name,src=path|env=VAR)"))?;
+        match k {
+            "id" => id = Some(v.to_string()),
+            "src" => src = Some(v.to_string()),
+            "env" => env = Some(v.to_string()),
+            _ => anyhow::bail!("bad --secret {spec:?} (unknown key {k:?})"),
+        }
+    }
+    let id = id.ok_or_else(|| anyhow!("bad --secret {spec:?} (missing id=)"))?;
+    if id.is_empty() {
+        anyhow::bail!("bad --secret {spec:?} (empty id)");
+    }
+    let value = match (src, env) {
+        (Some(p), None) => std::fs::read_to_string(&p)
+            .map_err(|e| anyhow!("bad --secret {id:?}: cannot read {p:?}: {e}"))?,
+        (None, Some(var)) => std::env::var(&var)
+            .map_err(|_| anyhow!("bad --secret {id:?}: env {var:?} is not set"))?,
+        _ => anyhow::bail!("bad --secret {id:?} (need exactly one of src=, env=)"),
+    };
+    Ok((id, value))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn build(
     api: &ApiClient,
     tags: &[String],
     dockerfile: &str,
     no_cache: bool,
+    no_cache_filter: &[String],
+    secrets: &[(String, String)],
     quiet: bool,
     path: &str,
 ) -> Result<()> {
@@ -396,27 +602,73 @@ pub async fn build(
     if !ctx.is_dir() {
         return Err(anyhow!("build context {path:?} is not a directory"));
     }
-    // .dockerignore → simple prefix/name filters.
-    let ignores: Vec<String> = std::fs::read_to_string(ctx.join(".dockerignore"))
-        .map(|f| f.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).map(|l| l.trim().trim_end_matches('/').to_string()).collect())
-        .unwrap_or_default();
+    // .dockerignore → anchored/negated/glob semantics via the shared
+    // matcher (last match wins on the full path, so a negation can
+    // re-include files under an excluded directory). The Dockerfile being
+    // sent and .dockerignore itself always ship, mirroring Docker.
+    // Excluded subtrees are pruned entirely — except ancestors of the
+    // always-sent files, and excluded directories while any negation
+    // exists (something beneath may be re-included).
+    let ignores = ingot_util::ignore::parse_ignore(
+        &std::fs::read_to_string(ctx.join(".dockerignore")).unwrap_or_default(),
+    );
+    // Forward-slash form of the Dockerfile path, as sent to the daemon.
+    let dockerfile_rel = dockerfile.replace('\\', "/");
+    let always_send = [dockerfile_rel.as_str(), ".dockerignore"];
+    let keep = |rel_s: &str| {
+        always_send.iter().any(|k| {
+            *k == rel_s
+                || k.starts_with(&format!("{rel_s}/"))
+                || rel_s.starts_with(&format!("{k}/"))
+        })
+    };
 
     let tmp = std::env::temp_dir().join(format!("ingot-ctx-{}.tar.gz", std::process::id()));
-    let gz = flate2::write::GzEncoder::new(std::fs::File::create(&tmp)?, flate2::Compression::fast());
+    let gz =
+        flate2::write::GzEncoder::new(std::fs::File::create(&tmp)?, flate2::Compression::fast());
     let mut tar = tar::Builder::new(gz);
-    for entry in walkdir::WalkDir::new(ctx).sort_by_file_name() {
+    let walker = walkdir::WalkDir::new(ctx)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|e| {
+            let rel = match e.path().strip_prefix(ctx) {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+            let rel_s = rel.to_string_lossy().replace('\\', "/");
+            if rel_s.is_empty() {
+                return true; // root
+            }
+            if keep(&rel_s) {
+                return true;
+            }
+            let excluded = ignores.is_excluded(&rel_s, e.file_type().is_dir());
+            // Prune excluded subtrees, but still descend when a negation
+            // may re-include something beneath this directory.
+            !(excluded && (!e.file_type().is_dir() || !ignores.has_negations()))
+        });
+    for entry in walker {
         let entry = entry?;
         let rel = entry.path().strip_prefix(ctx)?;
-        let rel_s = rel.to_string_lossy().to_string();
+        let rel_s = rel.to_string_lossy().replace('\\', "/");
         if rel_s.is_empty() {
             continue;
         }
-        if ignores.iter().any(|ig| rel_s == *ig || rel_s.starts_with(&format!("{ig}/"))) {
+        // Excluded files are skipped. Excluded directories reached here
+        // were descended for a possible negation below: emit the entry
+        // so re-included children have their parent in the archive.
+        if !keep(&rel_s) && !entry.file_type().is_dir() && ignores.is_excluded(&rel_s, false) {
             continue;
         }
         if entry.file_type().is_dir() {
             if !rel_s.is_empty() {
+                // Directory headers need a valid size + checksum or the
+                // daemon's tar reader rejects the whole archive.
                 let mut h = tar::Header::new_gnu();
+                h.set_entry_type(tar::EntryType::Directory);
+                h.set_size(0);
+                h.set_mode(0o755);
+                h.set_cksum();
                 tar.append_data(&mut h, &rel_s, std::io::empty())?;
             }
         } else {
@@ -436,11 +688,43 @@ pub async fn build(
     if no_cache {
         query.push_str("&nocache=1");
     }
+    for f in no_cache_filter {
+        query.push_str(&format!("&nocachefilter={}", url_escape(f)));
+    }
     if quiet {
         query.push_str("&q=1");
     }
+    // Stage secrets first, if any: values go in the POST body, and the
+    // one-time token returns in a header on the build request (never a
+    // URL, so it stays out of logs on both ends).
+    let secret_token: Option<String> = if secrets.is_empty() {
+        None
+    } else {
+        let values: std::collections::HashMap<&str, &str> = secrets
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let staged = api
+            .request_raw("POST", "/secrets", Some(serde_json::to_vec(&values)?))
+            .await?;
+        Some(
+            serde_json::from_slice::<serde_json::Value>(&staged)
+                .ok()
+                .and_then(|v| v.get("token")?.as_str().map(str::to_string))
+                .ok_or_else(|| anyhow!("POST /secrets did not return a token"))?,
+        )
+    };
+    let mut build_headers: Vec<(&str, &str)> = Vec::new();
+    if let Some(token) = &secret_token {
+        build_headers.push((ingot_api::BUILD_SECRET_TOKEN_HEADER, token.as_str()));
+    }
     let resp = api
-        .request("POST", &format!("/build?{}", query.trim_start_matches('&')), Some(body))
+        .request_with_headers(
+            "POST",
+            &format!("/build?{}", query.trim_start_matches('&')),
+            Some(body),
+            &build_headers,
+        )
         .await?;
     let mut final_image = String::new();
     crate::client::stream_lines(resp, |v| {
@@ -455,6 +739,363 @@ pub async fn build(
         }
     })
     .await?;
+    Ok(())
+}
+
+// ---- image: rmi, tag ----
+
+pub async fn rmi(api: &ApiClient, force: bool, images: &[String]) -> Result<()> {
+    for image in images {
+        let suffix = if force { "?force=1" } else { "" };
+        let events: serde_json::Value = api
+            .request_json("DELETE", &format!("/images/{image}{suffix}"), None)
+            .await?;
+        let events = events.as_array().cloned().unwrap_or_default();
+        for ev in &events {
+            if let Some(t) = ev["Untagged"].as_str() {
+                if !t.is_empty() {
+                    println!("Untagged: {t}");
+                }
+            }
+            if let Some(d) = ev["Deleted"].as_str() {
+                if !d.is_empty() {
+                    println!("Deleted: {d}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn tag(api: &ApiClient, source: &str, target: &str) -> Result<()> {
+    let (repo, tag) = match target.split_once(':') {
+        Some((r, t)) => (r, Some(t)),
+        None => (target, None),
+    };
+    let mut url = format!("/images/{source}/tag?repo={}", url_escape(repo));
+    if let Some(t) = tag {
+        url.push_str(&format!("&tag={}", url_escape(t)));
+    }
+    api.request_raw("POST", &url, None).await?;
+    Ok(())
+}
+
+// ---- cp ----
+
+/// Split a `container:path` spec into (container, path). Returns None for
+/// a plain local path. A leading `/` is a local absolute path, not a
+/// container name.
+fn split_cp_spec(spec: &str) -> Option<(&str, &str)> {
+    let (c, p) = spec.split_once(':')?;
+    if c.is_empty() || p.is_empty() {
+        return None;
+    }
+    // Container names/ids are alphanumeric + `-_._`; a Windows drive letter
+    // (`C:\foo`) would collide but we're Linux-only.
+    if c.contains('/') || c.contains('\\') {
+        return None;
+    }
+    Some((c, p))
+}
+
+pub async fn cp(api: &ApiClient, source: &str, dest: &str) -> Result<()> {
+    use std::io::Write;
+    let src_ctn = split_cp_spec(source);
+    let dst_ctn = split_cp_spec(dest);
+    if src_ctn.is_some() == dst_ctn.is_some() {
+        return Err(anyhow!(
+            "exactly one of SRC and DEST must be a container (form: container:path)"
+        ));
+    }
+    if let Some((ctn, path)) = src_ctn {
+        // Download tar from container, extract to local dest.
+        let resp = api
+            .request(
+                "GET",
+                &format!("/containers/{ctn}/archive?path={}", url_escape(path)),
+                None,
+            )
+            .await?;
+        let bytes = resp.into_body().collect().await?.to_bytes();
+        let dest_path = std::path::Path::new(dest);
+        // If dest is an existing directory, extract into it; otherwise
+        // extract in place (docker creates the leaf).
+        let into = if dest_path.is_dir() {
+            dest_path
+        } else {
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            dest_path
+        };
+        let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+        archive.unpack(into)?;
+        return Ok(());
+    }
+    // Upload local source to container.
+    let (ctn, path) = dst_ctn.unwrap();
+    let src_path = std::path::Path::new(source);
+    if !src_path.exists() {
+        return Err(anyhow!("no such local path: {source}"));
+    }
+    let tmp = std::env::temp_dir().join(format!("ingot-cp-{}.tar", std::process::id()));
+    let file = std::fs::File::create(&tmp)?;
+    let mut tar = tar::Builder::new(file);
+    let base = src_path.file_name().unwrap_or_default();
+    if src_path.is_dir() {
+        tar.append_dir_all(base, src_path)?;
+    } else {
+        tar.append_path_with_name(src_path, base)?;
+    }
+    tar.finish()?;
+    let body = std::fs::read(&tmp)?;
+    let _ = std::fs::remove_file(&tmp);
+    api.request_raw(
+        "PUT",
+        &format!("/containers/{ctn}/archive?path={}", url_escape(path)),
+        Some(body),
+    )
+    .await?;
+    let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+// ---- network ----
+
+pub async fn network_ls(api: &ApiClient) -> Result<()> {
+    let list: Vec<serde_json::Value> = api.get_json("/networks").await?;
+    println!(
+        "{:<20} {:<12} {:<18} {:<16}",
+        "NETWORK ID", "NAME", "DRIVER", "SUBNET"
+    );
+    for n in &list {
+        let id = n["Id"].as_str().unwrap_or("");
+        let subnet = n["IPAM"]["Config"][0]["Subnet"].as_str().unwrap_or("");
+        println!(
+            "{:<20} {:<12} {:<18} {:<16}",
+            &id[..12.min(id.len())],
+            n["Name"].as_str().unwrap_or(""),
+            n["Driver"].as_str().unwrap_or(""),
+            subnet,
+        );
+    }
+    Ok(())
+}
+
+pub async fn network_create(
+    api: &ApiClient,
+    name: &str,
+    subnet: Option<&str>,
+    gateway: Option<&str>,
+    internal: bool,
+    labels: &[String],
+) -> Result<()> {
+    let mut ipam = serde_json::json!({});
+    if subnet.is_some() || gateway.is_some() {
+        let mut cfg = serde_json::json!({});
+        if let Some(s) = subnet {
+            cfg["Subnet"] = serde_json::json!(s);
+        }
+        if let Some(g) = gateway {
+            cfg["Gateway"] = serde_json::json!(g);
+        }
+        ipam = serde_json::json!({"Config": [cfg]});
+    }
+    let mut body = serde_json::json!({
+        "Name": name,
+        "Internal": internal,
+        "IPAM": ipam,
+    });
+    if !labels.is_empty() {
+        let map: serde_json::Map<String, serde_json::Value> = labels
+            .iter()
+            .filter_map(|l| {
+                let (k, v) = l.split_once('=')?;
+                Some((k.to_string(), serde_json::json!(v)))
+            })
+            .collect();
+        body["Labels"] = serde_json::Value::Object(map);
+    }
+    let resp: serde_json::Value = api.post("/networks/create", Some(body)).await?;
+    let id = resp["Id"].as_str().unwrap_or("");
+    println!("{}", &id[..12.min(id.len())]);
+    Ok(())
+}
+
+pub async fn network_rm(api: &ApiClient, networks: &[String]) -> Result<()> {
+    for n in networks {
+        api.request_raw("DELETE", &format!("/networks/{n}"), None)
+            .await?;
+        println!("{n}");
+    }
+    Ok(())
+}
+
+pub async fn network_inspect(api: &ApiClient, network: &str) -> Result<()> {
+    let v: serde_json::Value = api.get_json(&format!("/networks/{network}")).await?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+pub async fn network_connect(
+    api: &ApiClient,
+    network: &str,
+    container: &str,
+    aliases: &[String],
+) -> Result<()> {
+    let mut body = serde_json::json!({"Container": container});
+    if !aliases.is_empty() {
+        body["EndpointConfig"] = serde_json::json!({"Aliases": aliases});
+    }
+    api.post::<serde_json::Value>(&format!("/networks/{network}/connect"), Some(body))
+        .await
+        .ok();
+    Ok(())
+}
+
+pub async fn network_disconnect(
+    api: &ApiClient,
+    network: &str,
+    container: &str,
+    force: bool,
+) -> Result<()> {
+    let body = serde_json::json!({"Container": container, "Force": force});
+    api.post::<serde_json::Value>(&format!("/networks/{network}/disconnect"), Some(body))
+        .await
+        .ok();
+    Ok(())
+}
+
+pub async fn network_prune(api: &ApiClient) -> Result<()> {
+    let v: serde_json::Value = api.post("/networks/prune", None).await?;
+    let deleted = v["NetworksDeleted"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    println!("Deleted {} unused network(s)", deleted);
+    Ok(())
+}
+
+// ---- volume ----
+
+pub async fn volume_ls(api: &ApiClient) -> Result<()> {
+    let v: serde_json::Value = api.get_json("/volumes").await?;
+    println!(
+        "{:<32} {:<12} {:<16}",
+        "VOLUME NAME", "DRIVER", "MOUNTPOINT"
+    );
+    if let Some(vols) = v["Volumes"].as_array() {
+        for vol in vols {
+            println!(
+                "{:<32} {:<12} {:<16}",
+                vol["Name"].as_str().unwrap_or(""),
+                vol["Driver"].as_str().unwrap_or(""),
+                vol["Mountpoint"].as_str().unwrap_or(""),
+            );
+        }
+    }
+    Ok(())
+}
+
+pub async fn volume_create(api: &ApiClient, name: Option<&str>, labels: &[String]) -> Result<()> {
+    let mut body = serde_json::json!({});
+    if let Some(n) = name {
+        body["Name"] = serde_json::json!(n);
+    }
+    if !labels.is_empty() {
+        let map: serde_json::Map<String, serde_json::Value> = labels
+            .iter()
+            .filter_map(|l| {
+                let (k, v) = l.split_once('=')?;
+                Some((k.to_string(), serde_json::json!(v)))
+            })
+            .collect();
+        body["Labels"] = serde_json::Value::Object(map);
+    }
+    let resp: serde_json::Value = api.post("/volumes/create", Some(body)).await?;
+    println!("{}", resp["Name"].as_str().unwrap_or(""));
+    Ok(())
+}
+
+pub async fn volume_rm(api: &ApiClient, volumes: &[String]) -> Result<()> {
+    for v in volumes {
+        api.request_raw("DELETE", &format!("/volumes/{v}"), None)
+            .await?;
+        println!("{v}");
+    }
+    Ok(())
+}
+
+pub async fn volume_inspect(api: &ApiClient, volume: &str) -> Result<()> {
+    let v: serde_json::Value = api.get_json(&format!("/volumes/{volume}")).await?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+pub async fn volume_prune(api: &ApiClient) -> Result<()> {
+    let v: serde_json::Value = api.post("/volumes/prune", None).await?;
+    println!(
+        "Deleted {} volume(s)",
+        v["VolumesDeleted"].as_i64().unwrap_or(0)
+    );
+    Ok(())
+}
+
+// ---- system ----
+
+pub async fn system_df(api: &ApiClient) -> Result<()> {
+    let v: serde_json::Value = api.get_json("/system/df").await?;
+    let images = v["Images"].as_array().map(|a| a.len()).unwrap_or(0);
+    let layers_size = v["LayersSize"].as_i64().unwrap_or(0);
+    let containers = v["Containers"].as_array().map(|a| a.len()).unwrap_or(0);
+    let volumes = v["Volumes"].as_array().map(|a| a.len()).unwrap_or(0);
+    let build_cache = v["BuildCache"].as_array().map(|a| a.len()).unwrap_or(0);
+    println!("TYPE            TOTAL     ACTIVE    SIZE        RECLAIMABLE");
+    println!(
+        "Images          {:<9} {:<9} {:<11} 0B (0%)",
+        images,
+        0,
+        human_size(layers_size)
+    );
+    println!(
+        "Containers      {:<9} {:<9} 0B          0B (0%)",
+        containers, 0
+    );
+    println!(
+        "Local Volumes   {:<9} {:<9} 0B          0B (0%)",
+        volumes, 0
+    );
+    println!(
+        "Build Cache     {:<9} {:<9} 0B          0B (0%)",
+        build_cache, 0
+    );
+    Ok(())
+}
+
+pub async fn system_prune(api: &ApiClient, force: bool) -> Result<()> {
+    if !force {
+        eprint!("This will remove all stopped containers, dangling images, unused networks and volumes. Continue? [y/N] ");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)?;
+        if !line.trim().eq_ignore_ascii_case("y") {
+            return Ok(());
+        }
+    }
+    let mut reclaimed: i64 = 0;
+    let c: serde_json::Value = api.post("/containers/prune", None).await?;
+    reclaimed += c["SpaceReclaimed"].as_i64().unwrap_or(0);
+    let i: serde_json::Value = api.post("/images/prune", None).await?;
+    reclaimed += i["SpaceReclaimed"].as_i64().unwrap_or(0);
+    let v: serde_json::Value = api.post("/volumes/prune", None).await?;
+    reclaimed += v["Reclaimable"].as_i64().unwrap_or(0);
+    let n: serde_json::Value = api.post("/networks/prune", None).await?;
+    let nets = n["NetworksDeleted"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    println!("Deleted {} network(s)", nets);
+    println!("Total reclaimed space: {}", human_size(reclaimed));
     Ok(())
 }
 

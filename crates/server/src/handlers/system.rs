@@ -23,7 +23,9 @@ pub async fn ping() -> Response {
 pub async fn version(State(_state): State<SharedState>) -> Response {
     let uname = uname_info();
     let v = Version {
-        Platform: VersionPlatform { Name: format!("Ingot Engine ({} {})", uname.0, uname.2) },
+        Platform: VersionPlatform {
+            Name: format!("Ingot Engine ({} {})", uname.0, uname.2),
+        },
         Version: ingot_api::ENGINE_VERSION.into(),
         ApiVersion: ingot_api::API_VERSION.into(),
         MinAPIVersion: ingot_api::MIN_API_VERSION.into(),
@@ -36,17 +38,24 @@ pub async fn version(State(_state): State<SharedState>) -> Response {
         Components: Some(vec![VersionComponent {
             Name: "Engine".into(),
             Version: ingot_api::ENGINE_VERSION.into(),
-            Details: Some([
-                ("ApiVersion".to_string(), ingot_api::API_VERSION.to_string()),
-                ("MinAPIVersion".to_string(), ingot_api::MIN_API_VERSION.to_string()),
-                ("Arch".to_string(), std::env::consts::ARCH.to_string()),
-                ("Os".to_string(), "linux".to_string()),
-                ("Experimental".to_string(), "false".to_string()),
-                ("GitCommit".to_string(), "dev".to_string()),
-                ("GoVersion".to_string(), "rustc".to_string()),
-                ("KernelVersion".to_string(), uname.2.clone()),
-                ("BuildTime".to_string(), chrono::Utc::now().to_rfc3339()),
-            ].into_iter().collect()),
+            Details: Some(
+                [
+                    ("ApiVersion".to_string(), ingot_api::API_VERSION.to_string()),
+                    (
+                        "MinAPIVersion".to_string(),
+                        ingot_api::MIN_API_VERSION.to_string(),
+                    ),
+                    ("Arch".to_string(), std::env::consts::ARCH.to_string()),
+                    ("Os".to_string(), "linux".to_string()),
+                    ("Experimental".to_string(), "false".to_string()),
+                    ("GitCommit".to_string(), "dev".to_string()),
+                    ("GoVersion".to_string(), "rustc".to_string()),
+                    ("KernelVersion".to_string(), uname.2.clone()),
+                    ("BuildTime".to_string(), chrono::Utc::now().to_rfc3339()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
         }]),
     };
     axum::Json(v).into_response()
@@ -56,13 +65,14 @@ pub async fn info(State(state): State<SharedState>) -> Response {
     let uname = uname_info();
     let (nproc, memtotal) = sys_info();
     let cgroup_v2 = std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").is_ok();
+    let (n_containers, n_running, n_paused, n_images) = census(&state).await;
     let info = Info {
         ID: daemon_id(&state),
-        Containers: 0,
-        ContainersRunning: 0,
-        ContainersPaused: 0,
-        ContainersStopped: 0,
-        Images: 0,
+        Containers: n_containers,
+        ContainersRunning: n_running,
+        ContainersPaused: n_paused,
+        ContainersStopped: n_containers - n_running - n_paused,
+        Images: n_images,
         Driver: "overlay2".into(),
         DriverStatus: vec![
             vec!["Backing Filesystem".into(), "extfs".into()],
@@ -87,7 +97,9 @@ pub async fn info(State(state): State<SharedState>) -> Response {
         LoggingDriver: "json-file".into(),
         CgroupDriver: "cgroupfs".into(),
         CgroupVersion: if cgroup_v2 { "2".into() } else { "1".into() },
-        NEventsListener: state.event_listeners.load(std::sync::atomic::Ordering::Relaxed),
+        NEventsListener: state
+            .event_listeners
+            .load(std::sync::atomic::Ordering::Relaxed),
         KernelVersion: uname.2,
         OperatingSystem: uname.0,
         OSVersion: uname.1,
@@ -107,6 +119,206 @@ pub async fn info(State(state): State<SharedState>) -> Response {
         Warnings: vec![],
     };
     axum::Json(info).into_response()
+}
+
+/// Recursive directory size in bytes (symlinks not followed).
+fn dir_size(path: &std::path::Path) -> i64 {
+    let mut total: i64 = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                stack.push(p);
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len() as i64);
+            }
+        }
+    }
+    total
+}
+
+/// Builder-cache rollup for /system/df: entry count, bytes still on
+/// disk (blobs referenced by live entries), and how many entries root
+/// layers still referenced by an image (the rest is all reclaimable).
+fn build_cache_summary(
+    state: &SharedState,
+    images: &[ingot_image::ImageRecord],
+) -> serde_json::Value {
+    use serde_json::json;
+    let empty =
+        || json!({"Type": "regular", "TotalCount": 0, "Size": 0, "InUse": 0, "Shareable": 0});
+    let data = match std::fs::read(state.paths.build_cache()) {
+        Ok(d) => d,
+        Err(_) => return empty(),
+    };
+    let entries: std::collections::HashMap<String, serde_json::Value> =
+        serde_json::from_slice(&data).unwrap_or_default();
+    if entries.is_empty() {
+        return empty();
+    }
+    let used_layers: std::collections::HashSet<&str> = images
+        .iter()
+        .flat_map(|r| r.diff_ids.iter().map(String::as_str))
+        .collect();
+    let mut size: i64 = 0;
+    let mut in_use: i64 = 0;
+    for e in entries.values() {
+        let diff = e.get("diff_id").and_then(|v| v.as_str()).unwrap_or("");
+        let blob = e
+            .get("blob_digest")
+            .and_then(|v| v.as_str())
+            .unwrap_or(diff);
+        if !blob.is_empty() {
+            size += std::fs::metadata(state.paths.blob(blob))
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
+        }
+        if used_layers.contains(diff) {
+            in_use += 1;
+        }
+    }
+    json!({
+        "Type": "regular",
+        "TotalCount": entries.len(),
+        "Size": size,
+        "InUse": in_use,
+        "Shareable": size,
+    })
+}
+
+/// GET /system/df — real disk-usage accounting (Plan Phase 1, unit 1.5).
+/// `SizeRw` is the container writable-layer (overlay diff) size;
+/// `SizeRootFs` approximates writable + image size. BuildCache carries
+/// the builder-cache rollup (Plan Phase 5, unit 5.4).
+pub async fn df(State(state): State<SharedState>) -> Response {
+    use serde_json::json;
+    let images = state.images.list_effective().await.unwrap_or_default();
+    let containers = match state.containers.as_ref() {
+        Some(m) => m.list_records().await,
+        None => Vec::new(),
+    };
+    let usage: std::collections::HashMap<String, i64> = {
+        let mut m = std::collections::HashMap::new();
+        for c in &containers {
+            *m.entry(c.image_id.trim_start_matches("sha256:").to_string())
+                .or_default() += 1;
+        }
+        m
+    };
+    let image_items: Vec<serde_json::Value> = images
+        .iter()
+        .map(|r| {
+            json!({
+                "Id": format!("sha256:{}", r.id),
+                "RepoTags": r.repo_tags,
+                "RepoDigests": r.repo_digests,
+                "Created": r.created_unix,
+                "Size": r.size,
+                "SharedSize": -1,
+                "Containers": usage.get(&r.id).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    let container_items: Vec<serde_json::Value> = containers
+        .iter()
+        .map(|c| {
+            let size_rw = dir_size(&state.paths.overlay_diff(&c.id));
+            let img_size = images
+                .iter()
+                .find(|i| i.id == c.image_id.trim_start_matches("sha256:"))
+                .map(|i| i.size)
+                .unwrap_or(0);
+            json!({
+                "Id": c.id,
+                "Names": [format!("/{}", c.name)],
+                "Image": c.image_name,
+                "ImageID": c.image_id,
+                "Command": c.cmd_display,
+                "Created": chrono::DateTime::parse_from_rfc3339(&c.created)
+                    .map(|d| d.timestamp())
+                    .unwrap_or(0),
+                "State": "created",
+                "Status": "",
+                "SizeRw": size_rw,
+                "SizeRootFs": size_rw.saturating_add(img_size),
+            })
+        })
+        .collect();
+    let volume_items: Vec<serde_json::Value> = match state.volumes.as_ref() {
+        Some(vm) => vm
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| {
+                let dir = state.paths.volumes().join(&v.Name);
+                let refs = containers
+                    .iter()
+                    .flat_map(|c| c.mounts.iter())
+                    .filter(|m| m.name == v.Name || m.source == dir.to_string_lossy())
+                    .count() as i64;
+                json!({
+                    "Name": v.Name,
+                    "Driver": "local",
+                    "Mountpoint": dir,
+                    "Labels": v.Labels,
+                    "Scope": "local",
+                    "Options": {},
+                    "UsageData": {"Size": dir_size(&dir), "RefCount": refs},
+                })
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let layers_size: i64 = images.iter().map(|r| r.size).sum();
+    let cache = build_cache_summary(&state, &images);
+    axum::Json(ingot_api::SystemDFResponse {
+        LayersSize: Some(layers_size),
+        Images: Some(image_items),
+        Containers: Some(container_items),
+        Volumes: Some(volume_items),
+        BuildCache: Some(vec![cache]),
+    })
+    .into_response()
+}
+
+/// Live container/image census for `/info` (Plan Phase 1, unit 1.5).
+/// States come from live handles when present, else the persisted state
+/// file — the same source the list endpoint reads.
+async fn census(state: &SharedState) -> (i64, i64, i64, i64) {
+    let mut total = 0i64;
+    let mut running = 0i64;
+    let mut paused = 0i64;
+    if let Some(mgr) = state.containers.as_ref() {
+        for record in mgr.list_records().await {
+            total += 1;
+            let status = if let Ok(Some(h)) = mgr.get(&record.id).await {
+                h.state.lock().unwrap().status
+            } else {
+                ingot_store::read_json(&state.paths.container_state(&record.id))
+                    .map(|st: ingot_runtime::record::ContainerState| st.status)
+                    .unwrap_or(ingot_runtime::record::StateStatus::Exited)
+            };
+            match status {
+                ingot_runtime::record::StateStatus::Running => running += 1,
+                ingot_runtime::record::StateStatus::Paused => paused += 1,
+                _ => {}
+            }
+        }
+    }
+    let images = state
+        .images
+        .list()
+        .await
+        .map(|v| v.len() as i64)
+        .unwrap_or(0);
+    (total, running, paused, images)
 }
 
 fn daemon_id(state: &SharedState) -> String {
@@ -132,7 +344,11 @@ fn uname_info() -> (String, String, String) {
     let mut utsname: libc::utsname = unsafe { std::mem::zeroed() };
     let _ = unsafe { libc::uname(&mut utsname) };
     let read = |f: &[i8]| {
-        let bytes: Vec<u8> = f.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        let bytes: Vec<u8> = f
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
         String::from_utf8_lossy(&bytes).to_string()
     };
     (
@@ -150,9 +366,13 @@ fn sys_info() -> (i64, i64) {
         .ok()
         .and_then(|s| {
             s.lines().find_map(|l| {
-                l.strip_prefix("MemTotal:")
-                    .map(|rest| rest.trim().trim_end_matches(" kB").trim().parse::<i64>().ok())
-                    .flatten()
+                l.strip_prefix("MemTotal:").and_then(|rest| {
+                    rest.trim()
+                        .trim_end_matches(" kB")
+                        .trim()
+                        .parse::<i64>()
+                        .ok()
+                })
             })
         })
         .map(|kb| kb * 1024)

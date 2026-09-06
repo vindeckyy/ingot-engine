@@ -5,11 +5,12 @@ use crate::client::ApiClient;
 use anyhow::{anyhow, Context, Result};
 use http_body_util::BodyExt;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
+// Compose-spec surface: fields are consumed incrementally (Plan Phase 9).
+#[allow(dead_code)]
 pub struct ComposeFile {
     pub version: Option<String>,
     #[serde(default)]
@@ -115,11 +116,15 @@ impl DependsOnSpec {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+// Compose-spec surface: honored by a future Phase 9 unit.
+#[allow(dead_code)]
 pub struct ComposeVolumeConfig {
     pub driver: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+// Compose-spec surface: honored by a future Phase 9 unit.
+#[allow(dead_code)]
 pub struct ComposeNetworkConfig {
     pub driver: Option<String>,
 }
@@ -157,14 +162,27 @@ pub fn resolve_compose_file(file_opt: Option<&str>) -> Result<(PathBuf, ComposeF
 
 pub fn resolve_project_name(proj_opt: Option<&str>, compose_path: &Path) -> String {
     if let Some(p) = proj_opt {
-        return p.to_lowercase().chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+        return p
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
     }
     if let Ok(dir) = compose_path.canonicalize().and_then(|p| {
         p.parent()
-            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no parent"))
+            .map(|p| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .ok_or_else(|| std::io::Error::other("no parent"))
     }) {
-        let clean: String = dir.to_lowercase().chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+        let clean: String = dir
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
         if !clean.is_empty() {
             return clean;
         }
@@ -249,10 +267,12 @@ pub async fn up(
             "com.docker.compose.network": "default"
         }
     });
-    let _ = api.post::<serde_json::Value>("/networks/create", Some(net_body)).await;
+    let _ = api
+        .post::<serde_json::Value>("/networks/create", Some(net_body))
+        .await;
 
     // 2. Create named volumes declared in compose
-    for (vname, _cfg) in &compose.volumes {
+    for vname in compose.volumes.keys() {
         let full_vname = format!("{project}_{vname}");
         let vol_body = serde_json::json!({
             "Name": full_vname,
@@ -262,7 +282,9 @@ pub async fn up(
                 "com.docker.compose.volume": vname
             }
         });
-        let _ = api.post::<serde_json::Value>("/volumes/create", Some(vol_body)).await;
+        let _ = api
+            .post::<serde_json::Value>("/volumes/create", Some(vol_body))
+            .await;
     }
 
     // 3. Dependency order
@@ -279,7 +301,10 @@ pub async fn up(
             let tag = format!("{project}-{service_name}:latest");
             let (ctx_dir, df) = match &s.build {
                 Some(BuildSpec::Simple(c)) => (compose_dir.join(c), "Dockerfile".to_string()),
-                Some(BuildSpec::Detailed { context, dockerfile }) => {
+                Some(BuildSpec::Detailed {
+                    context,
+                    dockerfile,
+                }) => {
                     let c = context.as_deref().unwrap_or(".");
                     let d = dockerfile.as_deref().unwrap_or("Dockerfile");
                     (compose_dir.join(c), d.to_string())
@@ -289,9 +314,11 @@ pub async fn up(
             println!("Building service {service_name}...");
             crate::commands::build(
                 api,
-                &[tag.clone()],
+                std::slice::from_ref(&tag),
                 &df,
                 false,
+                &[],
+                &[],
                 false,
                 &ctx_dir.to_string_lossy(),
             )
@@ -299,13 +326,19 @@ pub async fn up(
             tag
         } else if let Some(img) = &s.image {
             let inspect_path = format!("/images/{img}/json");
-            if api.get_json::<serde_json::Value>(&inspect_path).await.is_err() {
+            if api
+                .get_json::<serde_json::Value>(&inspect_path)
+                .await
+                .is_err()
+            {
                 println!("Pulling {img}...");
-                crate::commands::pull(api, img).await?;
+                crate::commands::pull(api, img, None).await?;
             }
             img.clone()
         } else {
-            return Err(anyhow!("service {service_name} has neither image nor build specified"));
+            return Err(anyhow!(
+                "service {service_name} has neither image nor build specified"
+            ));
         };
 
         let cname = s
@@ -313,23 +346,20 @@ pub async fn up(
             .clone()
             .unwrap_or_else(|| format!("{project}-{service_name}-1"));
 
-        let _ = api.request_raw("DELETE", &format!("/containers/{cname}?force=1"), None).await;
+        let _ = api
+            .request_raw("DELETE", &format!("/containers/{cname}?force=1"), None)
+            .await;
 
-        let mut port_bindings = HashMap::new();
+        let mut port_bindings: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
         for p in &s.ports {
-            if let Some((host, container)) = p.split_once(':') {
-                let ckey = if container.contains('/') { container.to_string() } else { format!("{container}/tcp") };
-                let (host_ip, host_port) = match host.split_once(':') {
-                    Some((ip, port)) => (ip.to_string(), port.to_string()),
-                    None => ("0.0.0.0".to_string(), host.to_string()),
-                };
-                port_bindings.insert(
-                    ckey,
-                    vec![serde_json::json!({
-                        "HostIp": host_ip,
-                        "HostPort": host_port
-                    })],
-                );
+            for m in crate::ports::parse_port_spec(p).map_err(|e| anyhow::anyhow!("{e}"))? {
+                port_bindings
+                    .entry(m.container_key)
+                    .or_default()
+                    .push(serde_json::json!({
+                        "HostIp": m.host_ip,
+                        "HostPort": m.host_port
+                    }));
             }
         }
 
@@ -353,16 +383,29 @@ pub async fn up(
             }
         }
 
-        let env = s.environment.as_ref().map(|e| e.to_vec()).unwrap_or_default();
+        let env = s
+            .environment
+            .as_ref()
+            .map(|e| e.to_vec())
+            .unwrap_or_default();
         let cmd = s.command.as_ref().map(|c| c.to_vec()).unwrap_or_default();
         let ep = s.entrypoint.as_ref().map(|e| e.to_vec());
 
         let mut labels = HashMap::new();
         labels.insert("com.docker.compose.project".to_string(), project.clone());
-        labels.insert("com.docker.compose.service".to_string(), service_name.clone());
-        labels.insert("com.docker.compose.container-number".to_string(), "1".to_string());
+        labels.insert(
+            "com.docker.compose.service".to_string(),
+            service_name.clone(),
+        );
+        labels.insert(
+            "com.docker.compose.container-number".to_string(),
+            "1".to_string(),
+        );
         labels.insert("com.docker.compose.oneoff".to_string(), "False".to_string());
-        labels.insert("com.docker.compose.version".to_string(), "2.24.0".to_string());
+        labels.insert(
+            "com.docker.compose.version".to_string(),
+            "2.24.0".to_string(),
+        );
 
         let create_body = serde_json::json!({
             "Image": image,
@@ -384,7 +427,11 @@ pub async fn up(
         });
 
         let created = api
-            .request_json("POST", &format!("/containers/create?name={cname}"), Some(serde_json::to_vec(&create_body)?))
+            .request_json(
+                "POST",
+                &format!("/containers/create?name={cname}"),
+                Some(serde_json::to_vec(&create_body)?),
+            )
             .await
             .with_context(|| format!("create container for {service_name}"))?;
 
@@ -422,24 +469,36 @@ pub async fn down(
     for c in containers {
         let labels = c.get("Labels").and_then(|l| l.as_object());
         if let Some(lbl) = labels {
-            if lbl.get("com.docker.compose.project").and_then(|v| v.as_str()) == Some(&project) {
+            if lbl
+                .get("com.docker.compose.project")
+                .and_then(|v| v.as_str())
+                == Some(&project)
+            {
                 let id = c["Id"].as_str().unwrap_or_default();
                 let name = c["Names"][0].as_str().unwrap_or(id).trim_start_matches('/');
-                let _ = api.request_raw("POST", &format!("/containers/{id}/stop?t=2"), None).await;
-                let _ = api.request_raw("DELETE", &format!("/containers/{id}?force=1"), None).await;
+                let _ = api
+                    .request_raw("POST", &format!("/containers/{id}/stop?t=2"), None)
+                    .await;
+                let _ = api
+                    .request_raw("DELETE", &format!("/containers/{id}?force=1"), None)
+                    .await;
                 println!(" ✔ Container {name}  Removed");
             }
         }
     }
 
     let net_name = format!("{project}_default");
-    let _ = api.request_raw("DELETE", &format!("/networks/{net_name}"), None).await;
+    let _ = api
+        .request_raw("DELETE", &format!("/networks/{net_name}"), None)
+        .await;
     println!(" ✔ Network {net_name}  Removed");
 
     if remove_volumes {
         for vname in compose.volumes.keys() {
             let full_vname = format!("{project}_{vname}");
-            let _ = api.request_raw("DELETE", &format!("/volumes/{full_vname}"), None).await;
+            let _ = api
+                .request_raw("DELETE", &format!("/volumes/{full_vname}"), None)
+                .await;
             println!(" ✔ Volume {full_vname}  Removed");
         }
     }
@@ -462,15 +521,22 @@ pub async fn ps(
         .await?;
 
     println!(
-        "{:<25} {:<20} {:<15} {:<25} {}",
-        "NAME", "IMAGE", "SERVICE", "STATUS", "PORTS"
+        "{:<25} {:<20} {:<15} {:<25} PORTS",
+        "NAME", "IMAGE", "SERVICE", "STATUS"
     );
 
     for c in containers {
         let labels = c.get("Labels").and_then(|l| l.as_object());
         if let Some(lbl) = labels {
-            if lbl.get("com.docker.compose.project").and_then(|v| v.as_str()) == Some(&project) {
-                let name = c["Names"][0].as_str().unwrap_or("?").trim_start_matches('/');
+            if lbl
+                .get("com.docker.compose.project")
+                .and_then(|v| v.as_str())
+                == Some(&project)
+            {
+                let name = c["Names"][0]
+                    .as_str()
+                    .unwrap_or("?")
+                    .trim_start_matches('/');
                 let image = c["Image"].as_str().unwrap_or("?");
                 let service = lbl
                     .get("com.docker.compose.service")
@@ -519,7 +585,11 @@ pub async fn logs(
     for c in &containers {
         let labels = c.get("Labels").and_then(|l| l.as_object());
         if let Some(lbl) = labels {
-            if lbl.get("com.docker.compose.project").and_then(|v| v.as_str()) == Some(&project) {
+            if lbl
+                .get("com.docker.compose.project")
+                .and_then(|v| v.as_str())
+                == Some(&project)
+            {
                 let sname = lbl
                     .get("com.docker.compose.service")
                     .and_then(|v| v.as_str())
@@ -546,11 +616,16 @@ pub async fn logs(
     if !follow {
         for (_sname, cname, id) in matched {
             let resp = api
-                .request_raw("GET", &format!("/containers/{id}/logs?stdout=1&stderr=1&tail=all"), None)
+                .request_raw(
+                    "GET",
+                    &format!("/containers/{id}/logs?stdout=1&stderr=1&tail=all"),
+                    None,
+                )
                 .await?;
             let mut pending = resp.to_vec();
             while pending.len() >= 8 {
-                let len = u32::from_be_bytes([pending[4], pending[5], pending[6], pending[7]]) as usize;
+                let len =
+                    u32::from_be_bytes([pending[4], pending[5], pending[6], pending[7]]) as usize;
                 if pending.len() < 8 + len {
                     break;
                 }
@@ -587,7 +662,9 @@ pub async fn logs(
                     let data = frame.data_ref().map(|b| b.as_ref()).unwrap_or(&[]);
                     pending.extend_from_slice(data);
                     while pending.len() >= 8 {
-                        let len = u32::from_be_bytes([pending[4], pending[5], pending[6], pending[7]]) as usize;
+                        let len =
+                            u32::from_be_bytes([pending[4], pending[5], pending[6], pending[7]])
+                                as usize;
                         if pending.len() < 8 + len {
                             break;
                         }

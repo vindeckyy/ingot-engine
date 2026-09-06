@@ -31,3 +31,7 @@ ingot-builder.workspace = true
 flate2.workspace = true
 tar.workspace = true
 tempfile.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
