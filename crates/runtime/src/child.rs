@@ -393,7 +393,7 @@ fn child_main(ctx: &ChildContext) -> Result<(), i32> {
     // already be closed if the parent went away).
     if ctx.exec_pipe_wr >= 0 {
         unsafe {
-            libc::write(ctx.exec_pipe_wr, [b'x'].as_ptr() as *const _, 1);
+            libc::write(ctx.exec_pipe_wr, b"x".as_ptr() as *const _, 1);
             libc::close(ctx.exec_pipe_wr);
         }
     }
