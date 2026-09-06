@@ -1,0 +1,22 @@
+[package]
+name = "ingot-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+nix.workspace = true
+libc.workspace = true
+caps.workspace = true
+chrono.workspace = true
+bytes.workspace = true
+ingot-util.workspace = true
+ingot-api.workspace = true
+ingot-store.workspace = true
+ingot-image.workspace = true
+ingot-network.workspace = true
+walkdir.workspace = true

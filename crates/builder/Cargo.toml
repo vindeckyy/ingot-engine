@@ -1,0 +1,25 @@
+[package]
+name = "ingot-builder"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tar.workspace = true
+flate2.workspace = true
+futures.workspace = true
+ingot-util.workspace = true
+ingot-api.workspace = true
+ingot-image.workspace = true
+ingot-runtime.workspace = true
+ingot-registry.workspace = true
+ingot-store.workspace = true
+walkdir.workspace = true
+glob.workspace = true
+bytes.workspace = true

@@ -1,0 +1,86 @@
+//! Docker-style random container names: adjective_scientist.
+//! The famous lists, shortened but in the same spirit; docker's actual lists
+//! are hundreds of entries long. Names ending in notable scientists get the
+//! `_right` treatment exactly like docker does (hilbert -> hilbert_right? no:
+//! docker appends "_right" when the name would collide with itself...).
+
+use rand::seq::SliceRandom;
+use rand::Rng;
+
+pub const ADJECTIVES: &[&str] = &[
+    "admiring", "adoring", "affectionate", "agitated", "amazing", "angry", "awesome", "beautiful",
+    "blissful", "bold", "boring", "brave", "busy", "charming", "clever", "cool", "compassionate",
+    "competent", "condescending", "confident", "cranky", "crazy", "dazzling", "determined",
+    "distracted", "dreamy", "eager", "ecstatic", "elastic", "elated", "elegant", "eloquent",
+    "epic", "exciting", "fervent", "festive", "flamboyant", "focused", "friendly", "frosty",
+    "funny", "gallant", "gifted", "goofy", "gracious", "great", "happy", "hardcore", "heuristic",
+    "hopeful", "hungry", "infallible", "inspiring", "intelligent", "interesting", "jolly",
+    "jovial", "keen", "kind", "laughing", "loving", "lucid", "magical", "modest", "musing",
+    "mystifying", "naughty", "nervous", "nice", "nifty", "nostalgic", "objective", "optimistic",
+    "peaceful", "pedantic", "pensive", "practical", "priceless", "quirky", "quizzical",
+    "recursing", "relaxed", "reverent", "romantic", "sad", "serene", "sharp", "silly", "sleepy",
+    "stoic", "strange", "stupefied", "suspicious", "sweet", "tender", "thirsty", "trusting",
+    "unruffled", "upbeat", "vibrant", "vigilant", "vigorous", "wizardly", "wonderful", "xenodochial",
+    "youthful", "zealous", "zen",
+];
+
+pub const SCIENTISTS: &[&str] = &[
+    "albattani", "allen", "almeida", "antonelli", "agnesi", "archimedes", "ardinghelli",
+    "aryabhata", "austin", "babbage", "banach", "bardeen", "bartik", "bassi", "beaver",
+    "bell", "benz", "bhabha", "bhaskara", "blackburn", "blackwell", "bohr", "booth", "borg",
+    "bose", "bouman", "boyd", "brahmagupta", "brattain", "brown", "buck", "burnell", "cannon",
+    "carson", "cartwright", "carver", "cerf", "chandrasekhar", "chaplygin", "chatelet", "chatterjee",
+    "chebyshev", "cohen", "colden", "cori", "cray", "curie", "darwin", "davinci", "dewdney",
+    "dhawan", "diffie", "dijkstra", "dubinsky", "easley", "edison", "einstein", "elbakyan",
+    "elgamal", "elion", "ellis", "engelbart", "euclid", "euler", "faraday", "feistel", "fermat",
+    "fermi", "feynman", "franklin", "gagarin", "galileo", "galois", "ganguly", "gates", "gauss",
+    "germain", "goldberg", "goldstine", "goldwasser", "golick", "goodall", "gould", "greider",
+    "grothendieck", "haibt", "hamilton", "hawking", "hellman", "heisenberg", "hermann", "herschel",
+    "hertz", "heyrovsky", "hodgkin", "hofstadter", "hoover", "hopper", "hugle", "hypatia",
+    "ishizaka", "jackson", "jang", "jemison", "jennings", "jepsen", "johnson", "joliot", "jones",
+    "kalam", "kapitsa", "kare", "keldysh", "keller", "kepler", "khayyam", "khorana", "kilby",
+    "kirch", "knuth", "kowalevski", "lalande", "lamarr", "lamport", "leakey", "leavitt",
+    "lederberg", "lehmann", "lewin", "lichterman", "liskov", "lovelace", "lumiere", "mahavira",
+    "margulis", "matsumoto", "maxwell", "mayer", "mccarthy", "mcclintock", "mclaren", "mclean",
+    "mcnulty", "meitner", "mendel", "mendeleev", "meucci", "meyerhof", "mirzakhani", "montalcini",
+    "moore", "morse", "murdock", "moser", "napier", "nash", "neumann", "newton", "nightingale",
+    "nobel", "noether", "northcutt", "noyce", "panini", "pare", "pascal", "pasteur", "payne",
+    "perlman", "pike", "poincare", "poitras", "proskuriakova", "ptolemy", "raman", "ramanujan",
+    "ride", "ritchie", "rhodes", "robinson", "roentgen", "rosalind", "rubin", "saha", "sammet",
+    "sanderson", "satoshi", "shamir", "shannon", "shaw", "shirley", "shockley", "shtern",
+    "sinoussi", "snyder", "solomon", "spence", "stonebraker", "sutherland", "swanson",
+    "swartz", "swirles", "taussig", "tereshkova", "tesla", "tharp", "thompson", "torvalds",
+    "tu", "turing", "varahamihira", "vaughan", "villani", "visvesvaraya", "volhard", "wescoff",
+    "wilbur", "wiles", "williams", "williamson", "wilson", "wing", "wozniak", "wright", "wu",
+    "yalow", "yonath", "zhukovsky",
+];
+
+/// Generate a random name like "fervent_turing". If it would be a "repeat
+/// offender" scientist name that collides with docker's own reserved list
+/// (e.g. boring_wozniak), append "_right" — Steve Wozniak is not boring.
+pub fn random_name() -> String {
+    let mut rng = rand::thread_rng();
+    let adjective = ADJECTIVES.choose(&mut rng).unwrap();
+    let scientist = SCIENTISTS.choose(&mut rng).unwrap();
+    let mut name = format!("{}_{}", adjective, scientist);
+    if matches!(*adjective, "boring" | "angry" | "stupefied") && *scientist == "wozniak" {
+        name.push_str("_right");
+    }
+    // ~10% of the time docker appends a random suffix; we skip that for readability.
+    let _ = rng.gen::<u32>();
+    name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_have_shape() {
+        for _ in 0..50 {
+            let n = random_name();
+            assert!(n.contains('_'));
+            assert!(n.len() > 5);
+        }
+    }
+}

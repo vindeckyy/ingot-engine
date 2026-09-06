@@ -1,0 +1,23 @@
+[package]
+name = "ingot-image"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tar.workspace = true
+flate2.workspace = true
+zstd.workspace = true
+sha2.workspace = true
+hex.workspace = true
+chrono.workspace = true
+walkdir.workspace = true
+libc.workspace = true
+ingot-util.workspace = true
+ingot-registry.workspace = true
+ingot-store.workspace = true
+ingot-api.workspace = true

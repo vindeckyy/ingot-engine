@@ -1,0 +1,26 @@
+//! Docker Engine API–compatible data transfer objects.
+//!
+//! Field names intentionally mirror the Engine API JSON exactly (including
+//! quirks like `ImageID`, `RepoDigests`, epoch `Created`) so that the real
+//! `docker` CLI and other Docker API clients can talk to ingot.
+#![allow(non_snake_case)]
+
+pub mod de;
+pub mod system;
+pub mod container;
+pub mod image;
+pub mod network;
+pub mod volume;
+
+pub use container::*;
+pub use image::*;
+pub use network::*;
+pub use system::*;
+pub use volume::*;
+
+/// API version we claim in `/_ping` (Docker 25.0-era).
+pub const API_VERSION: &str = "1.44";
+/// Oldest API version we accept from clients.
+pub const MIN_API_VERSION: &str = "1.24";
+/// Engine version string reported by /version.
+pub const ENGINE_VERSION: &str = "0.1.0";

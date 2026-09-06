@@ -1,0 +1,28 @@
+[package]
+name = "ingot-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ingot"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+tower-service = "0.3"
+tar.workspace = true
+flate2.workspace = true
+walkdir.workspace = true
+chrono.workspace = true
+futures.workspace = true
+ingot-api.workspace = true

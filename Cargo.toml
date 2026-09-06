@@ -1,0 +1,74 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/util",
+    "crates/api",
+    "crates/store",
+    "crates/registry",
+    "crates/image",
+    "crates/runtime",
+    "crates/network",
+    "crates/builder",
+    "crates/volume",
+    "crates/server",
+    "crates/ingotd",
+    "crates/ingot-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "gzip"] }
+nix = { version = "0.30", features = ["sched", "mount", "user", "signal", "process", "fs", "term", "hostname", "socket", "uio", "personality", "resource"] }
+libc = "0.2"
+caps = "0.5"
+rtnetlink = "0.17"
+netlink-packet-route = "0.22"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+hex = "0.4"
+tar = "0.4"
+flate2 = "1"
+zstd = "0.13"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+bytes = "1"
+walkdir = "2"
+glob = "0.3"
+base64 = "0.22"
+percent-encoding = "2"
+regex = "1"
+tempfile = "3"
+byteorder = "1"
+
+# internal
+ingot-util = { path = "crates/util" }
+ingot-api = { path = "crates/api" }
+ingot-store = { path = "crates/store" }
+ingot-registry = { path = "crates/registry" }
+ingot-image = { path = "crates/image" }
+ingot-runtime = { path = "crates/runtime" }
+ingot-network = { path = "crates/network" }
+ingot-builder = { path = "crates/builder" }
+ingot-volume = { path = "crates/volume" }
+ingot-server = { path = "crates/server" }
+
+[profile.release]
+opt-level = 2
+strip = true
