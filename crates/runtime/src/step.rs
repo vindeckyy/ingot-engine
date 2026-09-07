@@ -163,17 +163,7 @@ pub fn run_step(paths: &DataPaths, id: &str, opts: StepOptions) -> Result<(i32, 
         | libc::CLONE_NEWUTS
         | libc::CLONE_NEWIPC
         | libc::CLONE_NEWNET;
-    let pid = unsafe {
-        const STACK: usize = 8 * 1024 * 1024;
-        let mut stack = vec![0u8; STACK];
-        let top = ((stack.as_mut_ptr() as usize) + STACK - 16) & !0xF;
-        libc::clone(
-            crate::child::clone_entry,
-            top as *mut libc::c_void,
-            clone_flags,
-            ctx_ptr,
-        )
-    };
+    let pid = crate::child::clone_with_stack(crate::child::clone_entry, clone_flags, ctx_ptr);
     if pid < 0 {
         unsafe {
             libc::close(out_w);

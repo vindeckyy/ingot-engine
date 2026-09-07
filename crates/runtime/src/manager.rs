@@ -24,6 +24,9 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use tokio::sync::broadcast;
 
 pub struct ContainerHandle {
+    /// Immutable container id (no lock needed; previously cloned under
+    /// record lock on every id() call).
+    pub id: String,
     pub record: Mutex<ContainerRecord>,
     pub state: Mutex<ContainerState>,
     pub stdio: Arc<StdioHub>,
@@ -43,7 +46,7 @@ impl ContainerHandle {
     }
 
     pub fn id(&self) -> String {
-        self.record.lock().unwrap().id.clone()
+        self.id.clone()
     }
 }
 
@@ -310,8 +313,10 @@ impl ContainerManager {
             return Err(crate::error::CreateError::Internal(e));
         }
 
-        let (hub, stdin_rx) = StdioHub::new(self.paths.container_log(&id));
+        let rotation = crate::stdio::rotation_from_config(&record.hostconfig.LogConfig.config);
+        let (hub, stdin_rx) = StdioHub::with_rotation(self.paths.container_log(&id), rotation);
         let handle = Arc::new(ContainerHandle {
+            id: id.clone(),
             record: Mutex::new(record),
             state: Mutex::new(state),
             stdio: Arc::new(hub),
@@ -682,11 +687,14 @@ impl ContainerManager {
             };
 
             // ---- clone ----
+            // NEWCGROUP hides the host cgroup layout from /proc/self/cgroup
+            // and /sys/fs/cgroup (docker parity: private cgroupns).
             let clone_flags: i32 = libc::SIGCHLD
                 | libc::CLONE_NEWNS
                 | libc::CLONE_NEWPID
                 | libc::CLONE_NEWUTS
                 | libc::CLONE_NEWIPC
+                | libc::CLONE_NEWCGROUP
                 | if network_mode == "host" {
                     0
                 } else {
@@ -695,17 +703,7 @@ impl ContainerManager {
 
             let pid = {
                 let ctx_ptr = ctx.into_raw() as *mut libc::c_void;
-                let p = unsafe {
-                    const STACK: usize = 8 * 1024 * 1024;
-                    let mut stack = vec![0u8; STACK];
-                    let top = ((stack.as_mut_ptr() as usize) + STACK - 16) & !0xF;
-                    libc::clone(
-                        child_trampoline_shim,
-                        top as *mut libc::c_void,
-                        clone_flags,
-                        ctx_ptr,
-                    )
-                };
+                let p = crate::child::clone_with_stack(child_trampoline_shim, clone_flags, ctx_ptr);
                 if p < 0 {
                     unsafe { ChildContext::from_raw(ctx_ptr as *mut ChildContext) };
                 }
@@ -731,13 +729,18 @@ impl ContainerManager {
             // ---- cgroup ----
             let cgroup = match Cgroup::create(&record.id) {
                 Ok(cg) => {
-                    if let Err(e) = cg.apply(
-                        record.hostconfig.Memory,
-                        record.hostconfig.NanoCpus,
-                        record.hostconfig.CpuShares,
-                        record.hostconfig.PidsLimit,
-                        &record.hostconfig.CpusetCpus,
-                    ) {
+                    let hc = &record.hostconfig;
+                    let limits = crate::cgroup::CgroupLimits {
+                        memory_bytes: hc.Memory,
+                        memory_swap_bytes: hc.MemorySwap,
+                        nano_cpus: hc.NanoCpus,
+                        cpu_quota: hc.CpuQuota,
+                        cpu_period: hc.CpuPeriod,
+                        cpu_shares: hc.CpuShares,
+                        pids_limit: hc.PidsLimit,
+                        cpuset_cpus: hc.CpusetCpus.clone(),
+                    };
+                    if let Err(e) = cg.apply(&limits) {
                         let _ = write_ready(&ready_tx, b'e');
                         reap_now(pid);
                         cg.remove();
@@ -923,7 +926,7 @@ impl ContainerManager {
                         keys.extend(paliases.clone());
                         net_manager.detach(nid, pip, &record.id, &keys).await;
                     }
-                    let _ = ingot_store::write_json_atomic(
+                    let _ = ingot_store::write_json_batched(
                         &self.paths.container_config(&record.id),
                         &*handle.record.lock().unwrap(),
                     );
@@ -1001,7 +1004,7 @@ impl ContainerManager {
                                     entry.mac.clone_from(&ep.mac);
                                 }
                             }
-                            let _ = ingot_store::write_json_atomic(
+                            let _ = ingot_store::write_json_batched(
                                 &self.paths.container_config(&record.id),
                                 &*handle.record.lock().unwrap(),
                             );
@@ -1177,8 +1180,16 @@ impl ContainerManager {
                     let probe_paths = self.paths.clone();
                     let probe_id = record.id.clone();
                     let hc_clone = hc.clone();
+                    let probe_events = self.events.clone();
                     tokio::spawn(async move {
-                        run_healthcheck_loop(probe_handle, probe_paths, probe_id, hc_clone).await;
+                        run_healthcheck_loop(
+                            probe_handle,
+                            probe_paths,
+                            probe_id,
+                            hc_clone,
+                            probe_events,
+                        )
+                        .await;
                     });
                 }
             }
@@ -1267,12 +1278,10 @@ impl ContainerManager {
                 cg.remove();
                 let _ = overlay::unmount_rootfs(&paths, &live_id);
                 tracing::debug!(container = %live_id, exit = exit_code, "reaper: publishing die");
-                events.publish(EventMessage::new(
-                    "container",
-                    "die",
-                    &live_id,
-                    container_attrs(&mgr_handle),
-                ));
+                // Docker parity: the die event carries the exit code.
+                let mut die_attrs = container_attrs(&mgr_handle);
+                die_attrs.insert("exitCode".to_string(), exit_code.to_string());
+                events.publish(EventMessage::new("container", "die", &live_id, die_attrs));
                 let _ = mgr_handle.exit_tx.send(exit_code);
                 tracing::debug!(container = %live_id, "reaper: done");
                 if autoremove {
@@ -1513,6 +1522,15 @@ impl ContainerManager {
             if let Some(h) = live.get(name_or_id) {
                 return Ok(Some(h.clone()));
             }
+            // Name exact-match in live set before disk fallback (avoids
+            // directory scan for running containers looked up by name).
+            for h in live.values() {
+                if let Ok(rec) = h.record.try_lock() {
+                    if rec.name == name_or_id || format!("/{}", rec.name) == name_or_id {
+                        return Ok(Some(h.clone()));
+                    }
+                }
+            }
             for (id, h) in live.iter() {
                 if id.starts_with(name_or_id) {
                     return Ok(Some(h.clone()));
@@ -1531,8 +1549,11 @@ impl ContainerManager {
                 let state =
                     ingot_store::read_json::<ContainerState>(&self.paths.container_state(&r.id))
                         .unwrap_or_default();
-                let (hub, stdin_rx) = StdioHub::new(self.paths.container_log(&r.id));
+                let rotation = crate::stdio::rotation_from_config(&r.hostconfig.LogConfig.config);
+                let (hub, stdin_rx) =
+                    StdioHub::with_rotation(self.paths.container_log(&r.id), rotation);
                 let handle = Arc::new(ContainerHandle {
+                    id: r.id.clone(),
                     record: Mutex::new(r),
                     state: Mutex::new(state),
                     stdio: Arc::new(hub),
@@ -1577,7 +1598,7 @@ impl ContainerManager {
     pub async fn persist_state(&self, handle: &ContainerHandle) {
         let id = handle.id();
         let st = handle.state.lock().unwrap().clone();
-        let _ = ingot_store::write_json_atomic(&self.paths.container_state(&id), &st);
+        let _ = ingot_store::write_json_batched(&self.paths.container_state(&id), &st);
     }
 
     pub async fn remove(&self, id_or_name: &str, force: bool, remove_volumes: bool) -> Result<()> {
@@ -1791,15 +1812,32 @@ fn cstring(s: &str) -> Result<std::ffi::CString> {
     Ok(std::ffi::CString::new(s)?)
 }
 
+/// Numeric `--user` fast path: `uid:gid` or `uid:gid,gid2,...` with all
+/// parts numeric. Anything else (bare ids, names) falls through to
+/// in-container `/etc/passwd`+`/etc/group` resolution.
 fn parse_user_numeric(user: &str) -> (u32, u32, Vec<u32>) {
+    const MISS: (u32, u32, Vec<u32>) = (u32::MAX, u32::MAX, vec![]);
     if user.is_empty() {
-        return (u32::MAX, u32::MAX, vec![]); // let child resolve (root)
+        return MISS; // let child resolve (root)
     }
-    let (u, g) = user.split_once(':').unwrap_or((user, ""));
-    match (u.parse::<u32>(), g.parse::<u32>()) {
-        (Ok(uid), Ok(gid)) => (uid, gid, vec![]),
-        _ => (u32::MAX, u32::MAX, vec![]), // names: resolved in-child
+    let Some((u, groups)) = user.split_once(':') else {
+        return MISS; // bare uid or name: resolved in-child
+    };
+    let Ok(uid) = u.parse::<u32>() else {
+        return MISS;
+    };
+    let mut parts = groups.split(',');
+    let Some(gid) = parts.next().and_then(|g| g.parse::<u32>().ok()) else {
+        return MISS;
+    };
+    let mut extra = Vec::new();
+    for g in parts {
+        match g.parse::<u32>() {
+            Ok(x) => extra.push(x),
+            Err(_) => return MISS,
+        }
     }
+    (uid, gid, extra)
 }
 
 /// Split a `"port[/proto]"` key with the docker default proto. None when
@@ -2180,6 +2218,7 @@ async fn run_healthcheck_loop(
     paths: DataPaths,
     container_id: String,
     hc: ingot_api::HealthConfig,
+    events: EventBus,
 ) {
     let mut cmd = Vec::new();
     if !hc.Test.is_empty() {
@@ -2277,8 +2316,10 @@ async fn run_healthcheck_loop(
             break;
         }
 
-        {
+        // Docker parity: health transitions emit `health_status` events.
+        let transition = {
             let mut st = handle.state.lock().unwrap();
+            let mut transition = None;
             if let Some(h) = st.health.as_mut() {
                 h.Log.push(entry);
                 if h.Log.len() > 5 {
@@ -2286,15 +2327,30 @@ async fn run_healthcheck_loop(
                 }
                 if exit_code == 0 {
                     h.FailingStreak = 0;
-                    h.Status = "healthy".into();
+                    if h.Status != "healthy" {
+                        h.Status = "healthy".into();
+                        transition = Some("healthy");
+                    }
                 } else {
                     h.FailingStreak += 1;
                     let in_start_period = start_instant.elapsed() < start_period;
-                    if !in_start_period && h.FailingStreak >= retries {
+                    if !in_start_period && h.FailingStreak >= retries && h.Status != "unhealthy" {
                         h.Status = "unhealthy".into();
+                        transition = Some("unhealthy");
                     }
                 }
             }
+            transition
+        };
+        if let Some(status) = transition {
+            let mut attrs = container_attrs(&handle);
+            attrs.insert("healthStatus".to_string(), status.to_string());
+            events.publish(EventMessage::new(
+                "container",
+                "health_status",
+                &container_id,
+                attrs,
+            ));
         }
         let _ = ingot_store::write_json_atomic(
             &paths.container_state(&container_id),
@@ -2425,6 +2481,22 @@ mod tests {
     fn resolv_no_gateways_falls_back_to_host_file() {
         let rec = ContainerRecord::default();
         assert_eq!(build_resolv(&rec, &[]), default_resolv());
+    }
+
+    #[test]
+    fn numeric_user_multi_gid_splits() {
+        assert_eq!(parse_user_numeric("1000:100,200"), (1000, 100, vec![200]));
+        assert_eq!(parse_user_numeric("0:0"), (0, 0, vec![]));
+    }
+
+    #[test]
+    fn numeric_user_non_numeric_misses_to_child() {
+        let miss = (u32::MAX, u32::MAX, vec![]);
+        assert_eq!(parse_user_numeric(""), miss);
+        assert_eq!(parse_user_numeric("1000"), miss);
+        assert_eq!(parse_user_numeric("nobody:nogroup"), miss);
+        assert_eq!(parse_user_numeric("1000:abc"), miss);
+        assert_eq!(parse_user_numeric("1000:100,abc"), miss);
     }
 
     #[test]

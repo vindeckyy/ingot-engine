@@ -1,4 +1,4 @@
-.PHONY: all build release debug install uninstall test check strict clean completions run-daemon
+.PHONY: all build release debug install uninstall test check strict clean completions man run-daemon
 
 all: release
 
@@ -18,6 +18,8 @@ install: release
 uninstall:
 	rm -f $(or $(PREFIX),/usr/local)/bin/ingotd
 	rm -f $(or $(PREFIX),/usr/local)/bin/ingot
+	rm -f $(or $(PREFIX),/usr/local)/share/man/man1/ingot.1
+	rm -f $(or $(PREFIX),/usr/local)/share/man/man8/ingotd.8
 	rm -f /etc/systemd/system/ingotd.service
 	systemctl daemon-reload 2>/dev/null || true
 
@@ -43,6 +45,13 @@ completions: release
 	./target/release/ingot completions zsh  > target/completions/_ingot
 	./target/release/ingot completions fish > target/completions/ingot.fish
 	@echo "Completions in target/completions/"
+
+# Validate the static man pages render without warnings.
+man:
+	@command -v groff >/dev/null || (echo "groff not installed; skipping man render check" && exit 0)
+	groff -man -Tascii docs/man/ingot.1 > /dev/null
+	groff -man -Tascii docs/man/ingotd.8 > /dev/null
+	@echo "Man pages render clean."
 
 # Start the daemon in debug mode (requires root).
 run-daemon: debug

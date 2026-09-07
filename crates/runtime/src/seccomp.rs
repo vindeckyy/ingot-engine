@@ -148,7 +148,9 @@ pub const ALLOWED_SYSCALLS_X86_64: &[i64] = &[
     libc::SYS_rt_sigsuspend,
     libc::SYS_sigaltstack,
     libc::SYS_utime,
-    libc::SYS_mknod,
+    // mknod/mknodat intentionally ABSENT: with no device-cgroup backstop,
+    // device-node creation would allow host block-device access. Opt out
+    // with seccomp=unconfined (plus --cap-add MKNOD).
     libc::SYS_personality,
     libc::SYS_ustat,
     libc::SYS_statfs,
@@ -236,7 +238,7 @@ pub const ALLOWED_SYSCALLS_X86_64: &[i64] = &[
     libc::SYS_inotify_rm_watch,
     libc::SYS_openat,
     libc::SYS_mkdirat,
-    libc::SYS_mknodat,
+    // mknodat: see mknod above.
     libc::SYS_fchownat,
     libc::SYS_futimesat,
     libc::SYS_newfstatat,
@@ -277,15 +279,18 @@ pub const ALLOWED_SYSCALLS_X86_64: &[i64] = &[
     libc::SYS_perf_event_open,
     libc::SYS_recvmmsg,
     libc::SYS_prlimit64,
-    libc::SYS_name_to_handle_at,
-    libc::SYS_open_by_handle_at,
+    // name_to_handle_at/open_by_handle_at intentionally ABSENT: handle-based
+    // opens are classic chroot/pivot escape primitives with no legitimate
+    // in-container use.
     libc::SYS_clock_adjtime,
     libc::SYS_syncfs,
     libc::SYS_sendmmsg,
     libc::SYS_setns,
     libc::SYS_getcpu,
-    libc::SYS_process_vm_readv,
-    libc::SYS_process_vm_writev,
+    // process_vm_readv/writev intentionally ABSENT: cross-process memory
+    // access has no legitimate in-container use (container and daemon share
+    // uid 0, so same-user ptrace checks would not stop a hostile reader
+    // when the host Yama scope is relaxed).
     libc::SYS_sched_setattr,
     libc::SYS_sched_getattr,
     libc::SYS_renameat2,
@@ -357,6 +362,70 @@ mod tests {
     fn test_compile_default_seccomp_filter() {
         let prog = compile_default_seccomp_filter().unwrap();
         assert!(!prog.is_empty());
+    }
+
+    /// Escape-relevant syscalls must stay denied (security sweep: every
+    /// entry here is a container-escape primitive or a device-node path
+    /// with no device-cgroup backstop).
+    #[test]
+    fn test_escape_primitives_denied() {
+        for sys in [
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_pivot_root,
+            libc::SYS_mknod,
+            libc::SYS_mknodat,
+            libc::SYS_open_by_handle_at,
+            libc::SYS_name_to_handle_at,
+            libc::SYS_process_vm_readv,
+            libc::SYS_process_vm_writev,
+            libc::SYS_init_module,
+            libc::SYS_finit_module,
+            libc::SYS_delete_module,
+            libc::SYS_kexec_load,
+            libc::SYS_kexec_file_load,
+            libc::SYS_reboot,
+            libc::SYS_swapon,
+            libc::SYS_swapoff,
+            libc::SYS_iopl,
+            libc::SYS_ioperm,
+            libc::SYS_sethostname,
+            libc::SYS_setdomainname,
+            libc::SYS_acct,
+            libc::SYS_quotactl,
+            libc::SYS_add_key,
+            libc::SYS_request_key,
+            libc::SYS_keyctl,
+            libc::SYS_ptrace,
+            libc::SYS_kcmp,
+            libc::SYS_pidfd_getfd,
+            libc::SYS_fanotify_init,
+            libc::SYS_lookup_dcookie,
+            libc::SYS_move_pages,
+            // New mount API must stay denied alongside mount(2).
+            libc::SYS_open_tree,
+            libc::SYS_move_mount,
+            libc::SYS_fsopen,
+            libc::SYS_fsconfig,
+            libc::SYS_fsmount,
+        ] {
+            assert!(
+                !ALLOWED_SYSCALLS_X86_64.contains(&sys),
+                "syscall {sys} must stay seccomp-denied"
+            );
+        }
+        // io_uring is a standing kernel-exploit surface: all three doors
+        // stay shut.
+        for sys in [
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
+        ] {
+            assert!(
+                !ALLOWED_SYSCALLS_X86_64.contains(&sys),
+                "syscall {sys} must stay seccomp-denied"
+            );
+        }
     }
 
     #[test]

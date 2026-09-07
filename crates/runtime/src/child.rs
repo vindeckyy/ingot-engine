@@ -9,13 +9,18 @@ use anyhow::Result;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 
-/// Docker's default capability set.
+/// Default capability set. Deliberately Docker's set MINUS `MKNOD`:
+/// Ingot has no device-cgroup backstop (cgroup v2 removed the device
+/// controller), so a default-granted `CAP_MKNOD` would let any container
+/// create host block-device nodes and read/write host disks at block
+/// level, bypassing mount namespacing entirely. Users who need device
+/// nodes must opt in with `--cap-add MKNOD --security-opt
+/// seccomp=unconfined` (mknod is also seccomp-blocked by default).
 pub const DEFAULT_CAPS: &[&str] = &[
     "CHOWN",
     "DAC_OVERRIDE",
     "FSETID",
     "FOWNER",
-    "MKNOD",
     "NET_RAW",
     "SETGID",
     "SETUID",
@@ -283,20 +288,25 @@ fn child_main(ctx: &ChildContext) -> Result<(), i32> {
     if unsafe { libc::chdir(c"/".as_ptr()) } != 0 {
         return fail(125, "chdir / after pivot");
     }
-    umount_detach("/oldroot");
-    let _ = rmdir("/oldroot");
+    // The old root carries the host's mount tree: if it cannot be
+    // detached the container would see host mounts, so fail closed.
+    if umount_detach("/oldroot") {
+        let _ = rmdir("/oldroot");
+    } else {
+        return fail(125, "detach oldroot");
+    }
 
     // 7b. Masked paths, second pass (post-pivot, container-absolute):
     // whichever tree wins path resolution ends up masked.
     mask_paths("", "/dev/null").map_err(|e| fail(e, "mask paths (post-pivot)").err().unwrap())?;
-    // 7c. Tmpfs mounts from HostConfig.Tmpfs.
-    for (dest, opts) in &ctx.tmpfs {
-        let d = dest.to_str().unwrap_or("/");
-        mkdirs(d);
-        let data = opts.to_str().unwrap_or("mode=1777");
-        mount_fs("tmpfs", d, libc::MS_NOSUID | libc::MS_NODEV, data)
-            .map_err(|e| fail(e, "tmpfs mount").err().unwrap())?;
+    // 7c. Tmpfs mountpoints are created while the tree is still
+    // writable; the mounts themselves land after the read-only remount.
+    for (dest, _) in &ctx.tmpfs {
+        mkdirs(dest.to_str().unwrap_or("/"));
     }
+    // 7d. Read-only remount BEFORE tmpfs mounts: the recursive remount
+    // would otherwise seal the --tmpfs destinations too, breaking the
+    // documented contract that tmpfs stays writable under --read-only.
     if ctx.readonly_rootfs {
         mount_null(
             "/",
@@ -305,6 +315,14 @@ fn child_main(ctx: &ChildContext) -> Result<(), i32> {
             None,
         )
         .map_err(|e| fail(e, "readonly remount").err().unwrap())?;
+    }
+    // 7e. Tmpfs mounts from HostConfig.Tmpfs (always writable, even on a
+    // read-only rootfs — this is the documented writable area).
+    for (dest, opts) in &ctx.tmpfs {
+        let d = dest.to_str().unwrap_or("/");
+        let data = opts.to_str().unwrap_or("mode=1777");
+        mount_fs("tmpfs", d, libc::MS_NOSUID | libc::MS_NODEV, data)
+            .map_err(|e| fail(e, "tmpfs mount").err().unwrap())?;
     }
 
     // 8. Hostname (UTS namespace was created at clone).
@@ -489,35 +507,60 @@ fn resolve_user(ctx: &ChildContext) -> (u32, u32, Vec<u32>) {
         uid = user_part.parse().unwrap();
         found = true;
     }
-    let mut gid = primary_gid;
-    let mut extra = Vec::new();
-    if !group_part.is_empty() {
-        let group_db = std::fs::read_to_string("/etc/group").unwrap_or_default();
-        let mut resolved = false;
-        for line in group_db.lines() {
-            let fields: Vec<&str> = line.split(':').collect();
-            if fields.len() >= 3 && fields[0] == group_part {
-                gid = fields[2].parse().unwrap_or(primary_gid);
-                resolved = true;
-                break;
-            }
+    // Group list: first element is the primary gid, the rest are
+    // supplementary. Each element is a name (resolved against the
+    // in-container /etc/group) or a number.
+    let group_db;
+    let (gid, extra) = if group_part.is_empty() {
+        (primary_gid, Vec::new())
+    } else {
+        group_db = std::fs::read_to_string("/etc/group").unwrap_or_default();
+        match parse_group_list(&group_db, group_part, primary_gid) {
+            // Fail closed: an unresolvable group spec must not silently
+            // fall back to the passwd gid (possibly 0/root).
+            Some(v) => v,
+            None => return (u32::MAX, u32::MAX, Vec::new()),
         }
-        if !resolved {
-            if let Ok(g) = group_part.parse::<u32>() {
-                gid = g;
-            }
-        }
-        for g in group_part.split(',').skip(1) {
-            if let Ok(x) = g.parse::<u32>() {
-                extra.push(x);
-            }
-        }
-        let _ = extra.pop(); // the first entry is the primary gid
-    }
+    };
     if !found {
         return (u32::MAX, u32::MAX, vec![]);
     }
     (uid, gid, extra)
+}
+
+/// Resolve a `group[,group...]` list where each element is a group name
+/// (looked up in `group_db`, `/etc/group` format) or a number. The first
+/// element is the primary gid. `fallback_gid` covers an empty primary
+/// (`"uid:"` keeps the passwd-derived gid). Returns `None` when the
+/// primary or any extra cannot be resolved — callers fail closed. Pure:
+/// unit tested without touching the host.
+fn parse_group_list(
+    group_db: &str,
+    group_part: &str,
+    fallback_gid: u32,
+) -> Option<(u32, Vec<u32>)> {
+    let lookup = |name: &str| -> Option<u32> {
+        for line in group_db.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() >= 3 && fields[0] == name {
+                return fields[2].parse::<u32>().ok();
+            }
+        }
+        None
+    };
+    let resolve = |el: &str| -> Option<u32> { lookup(el).or_else(|| el.parse::<u32>().ok()) };
+    let mut parts = group_part.split(',');
+    let primary = match parts.next().unwrap_or("") {
+        "" => fallback_gid,
+        first => resolve(first)?,
+    };
+    let mut extra = Vec::new();
+    for g in parts {
+        // Unresolvable extras reject the whole spec: silently dropping a
+        // requested group would misrepresent the caller's intent.
+        extra.push(resolve(g)?);
+    }
+    Some((primary, extra))
 }
 
 /// Effective capability set for a container (Plan Phase 3, unit 3.1).
@@ -607,6 +650,38 @@ pub(crate) fn confine_caps(keep: &std::collections::HashSet<caps::Capability>) -
 /// so this needs no privilege beyond holding the caps in Permitted.
 pub(crate) fn restore_effective(keep: &std::collections::HashSet<caps::Capability>) -> bool {
     caps::set(None, caps::CapSet::Effective, keep).is_ok()
+}
+
+/// Clone with an mmap'd 8MB stack (no userspace memset). The kernel
+/// zeroes pages on fault, saving an 8MB memset per container start/build
+/// step vs `vec![0u8; 8MB]`. Falls back to a boxed stack on mmap failure.
+pub(crate) fn clone_with_stack(
+    entry: extern "C" fn(*mut libc::c_void) -> i32,
+    flags: i32,
+    arg: *mut libc::c_void,
+) -> i32 {
+    const STACK: usize = 8 * 1024 * 1024;
+    unsafe {
+        let mem = libc::mmap(
+            std::ptr::null_mut(),
+            STACK,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+            -1,
+            0,
+        );
+        if mem == libc::MAP_FAILED {
+            let mut stack = vec![0u8; STACK];
+            let top = ((stack.as_mut_ptr() as usize) + STACK - 16) & !0xF;
+            let r = libc::clone(entry, top as *mut libc::c_void, flags, arg);
+            let _ = stack;
+            return r;
+        }
+        let top = ((mem as usize) + STACK - 16) & !0xF;
+        let r = libc::clone(entry, top as *mut libc::c_void, flags, arg);
+        libc::munmap(mem, STACK);
+        r
+    }
 }
 
 /// Apply one validated ulimit (`-1` = unlimited). Raising a hard limit
@@ -757,6 +832,8 @@ fn mask_paths(root: &str, null: &str) -> Result<(), i32> {
         "/proc/timer_stats",
         "/proc/sched_debug",
         "/proc/scsi",
+        "/proc/sysrq-trigger",
+        "/proc/latency_stats",
         "/sys/firmware",
     ] {
         let t = format!("{root}{p}");
@@ -766,7 +843,16 @@ fn mask_paths(root: &str, null: &str) -> Result<(), i32> {
     }
     // Directories → empty read-only tmpfs over them (mount rw first:
     // a fresh tmpfs mount rejects MS_RDONLY, so remount read-only after).
-    for p in ["/sys/fs/selinux", "/proc/scsi", "/sys/firmware"] {
+    // /proc/bus, /proc/fs and /proc/irq expose host device/irq detail
+    // with no legitimate in-container use.
+    for p in [
+        "/sys/fs/selinux",
+        "/proc/scsi",
+        "/sys/firmware",
+        "/proc/bus",
+        "/proc/fs",
+        "/proc/irq",
+    ] {
         let t = format!("{root}{p}");
         if std::path::Path::new(&t).is_dir() {
             mount_tmpfs(&t, "mode=555")?;
@@ -797,11 +883,12 @@ fn symlink(target: &str, path: &str) {
     let _ = std::os::unix::fs::symlink(target, path);
 }
 
-fn umount_detach(path: &str) {
+/// Detach a mount; returns whether it is gone. MNT_DETACH essentially
+/// never fails — a failure means the old root (and the host mounts under
+/// it) would stay visible, so callers fail closed.
+fn umount_detach(path: &str) -> bool {
     let c = CString::new(path).unwrap();
-    unsafe {
-        libc::umount2(c.as_ptr(), libc::MNT_DETACH);
-    }
+    unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) == 0 }
 }
 
 fn rmdir(path: &str) -> Result<(), i32> {
@@ -881,6 +968,31 @@ mod tests {
     #[test]
     fn rlimit_unknown_name_fails() {
         assert_eq!(apply_rlimit("rtprio", 0, 0), Err("unknown rlimit"));
+    }
+
+    const GROUP_DB: &str = "root:x:0:\nstaff:x:50:\nnogroup:x:65534:\n";
+
+    #[test]
+    fn group_list_numeric_multi() {
+        assert_eq!(parse_group_list("", "100,200", 7), Some((100, vec![200])));
+    }
+
+    #[test]
+    fn group_list_named_and_numeric() {
+        assert_eq!(
+            parse_group_list(GROUP_DB, "staff,200", 7),
+            Some((50, vec![200]))
+        );
+    }
+
+    #[test]
+    fn group_list_unresolvable_primary_fails_closed() {
+        assert_eq!(parse_group_list(GROUP_DB, "nosuch,200", 7), None);
+    }
+
+    #[test]
+    fn group_list_unresolvable_extra_fails_closed() {
+        assert_eq!(parse_group_list(GROUP_DB, "staff,nosuch", 7), None);
     }
 
     #[test]

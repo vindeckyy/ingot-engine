@@ -11,51 +11,80 @@ pub struct Cgroup {
     dir: PathBuf,
 }
 
+/// Validated resource limits for one container (see
+/// `validate_hostconfig`: negatives are rejected at create, so every
+/// field here is either 0/empty (unset) or a meaningful value).
+#[derive(Debug, Clone, Default)]
+pub struct CgroupLimits {
+    pub memory_bytes: i64,
+    pub memory_swap_bytes: i64,
+    pub nano_cpus: i64,
+    pub cpu_quota: i64,
+    pub cpu_period: i64,
+    pub cpu_shares: i64,
+    pub pids_limit: i64,
+    pub cpuset_cpus: String,
+}
+
 impl Cgroup {
     /// Create `/sys/fs/cgroup/ingot.slice/<id>` and enable the controllers we
     /// use on the root and slice levels. Failing to enable a controller is
     /// non-fatal (kernel may not expose it); failing to mkdir is fatal.
+    ///
+    /// Controller enablement is boot-once: the first call programs
+    /// `cgroup.subtree_control` on root+slice, later calls only mkdir the
+    /// leaf. Use [`Cgroup::ensure_controllers`] at daemon boot to warm it.
     pub fn create(id: &str) -> Result<Cgroup> {
         let root = Path::new(CGROUP_ROOT);
-        enable_controllers(root)?;
+        ensure_controllers_cached(root);
         let slice = root.join(SLICE);
         std::fs::create_dir_all(&slice)?;
-        enable_controllers(&slice)?;
+        ensure_controllers_cached(&slice);
         let dir = slice.join(id);
         std::fs::create_dir_all(&dir)?;
         Ok(Cgroup { dir })
     }
 
-    pub fn apply(
-        &self,
-        memory_bytes: i64,
-        nano_cpus: i64,
-        cpu_shares: i64,
-        pids_limit: i64,
-        cpuset_cpus: &str,
-    ) -> Result<()> {
-        if memory_bytes > 0 {
-            write(&self.dir, "memory.max", &memory_bytes.to_string())?;
-            write(&self.dir, "memory.swap.max", &memory_bytes.to_string())?;
+    /// Boot-time warmup: enable controllers once so per-start `create`
+    /// never pays the `cgroup.controllers` read + `subtree_control` write.
+    pub fn ensure_controllers() {
+        let root = Path::new(CGROUP_ROOT);
+        let _ = enable_controllers(root);
+        let slice = root.join(SLICE);
+        if std::fs::create_dir_all(&slice).is_ok() {
+            let _ = enable_controllers(&slice);
+            mark_controllers_cached(root);
+            mark_controllers_cached(&slice);
         }
-        if nano_cpus > 0 {
-            // nano_cpus → "max $quota $period" (period 100ms)
-            let quota = nano_cpus / 100_000; // per 100ms
-            let val = if quota >= 100_000_000 {
-                "max 100000".to_string()
-            } else {
-                format!("{quota} 100000")
-            };
+    }
+
+    pub fn apply(&self, lim: &CgroupLimits) -> Result<()> {
+        if lim.memory_bytes > 0 {
+            write(&self.dir, "memory.max", &lim.memory_bytes.to_string())?;
+            write(
+                &self.dir,
+                "memory.swap.max",
+                &swap_max_value(lim.memory_bytes, lim.memory_swap_bytes),
+            )?;
+        } else if lim.memory_swap_bytes > 0 {
+            // Swap cap without a memory cap: still enforced.
+            write(
+                &self.dir,
+                "memory.swap.max",
+                &lim.memory_swap_bytes.to_string(),
+            )?;
+        }
+        if let Some(val) = cpu_max_value(lim.nano_cpus, lim.cpu_quota, lim.cpu_period) {
             write(&self.dir, "cpu.max", &val)?;
-        } else if cpu_shares > 0 {
-            let weight = shares_to_weight(cpu_shares);
+        } else if lim.cpu_shares > 0 {
+            let weight = shares_to_weight(lim.cpu_shares);
             write(&self.dir, "cpu.weight", &weight.to_string())?;
         }
-        if pids_limit > 0 {
-            write(&self.dir, "pids.max", &pids_limit.to_string())?;
+        if lim.pids_limit > 0 {
+            write(&self.dir, "pids.max", &lim.pids_limit.to_string())?;
         }
-        if !cpuset_cpus.is_empty() {
-            write(&self.dir, "cpuset.cpus", cpuset_cpus)?;
+        if !lim.cpuset_cpus.is_empty() {
+            write(&self.dir, "cpuset.cpus", &lim.cpuset_cpus)?;
         }
         Ok(())
     }
@@ -141,7 +170,7 @@ fn parse_oom_kills(events: &str) -> Option<u64> {
 fn enable_controllers(dir: &Path) -> Result<()> {
     let available = std::fs::read_to_string(dir.join("cgroup.controllers"))
         .map_err(|e| anyhow!("read cgroup.controllers: {e}"))?;
-    let mut want = String::new();
+    let mut want = String::with_capacity(32);
     for c in ["cpu", "memory", "pids", "cpuset", "io"] {
         if available.split_whitespace().any(|x| x == c) {
             want.push_str(&format!("+{c} "));
@@ -153,8 +182,69 @@ fn enable_controllers(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+static CONTROLLERS_DONE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn controllers_done() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    CONTROLLERS_DONE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn ensure_controllers_cached(dir: &Path) {
+    let key = dir.to_string_lossy().to_string();
+    {
+        let guard = controllers_done().lock().unwrap();
+        if guard.contains(&key) {
+            return;
+        }
+    }
+    if enable_controllers(dir).is_ok() {
+        controllers_done().lock().unwrap().insert(key);
+    }
+}
+
+fn mark_controllers_cached(dir: &Path) {
+    controllers_done()
+        .lock()
+        .unwrap()
+        .insert(dir.to_string_lossy().to_string());
+}
+
 fn write(dir: &Path, file: &str, val: &str) -> Result<()> {
     std::fs::write(dir.join(file), val).map_err(|e| anyhow!("write {file}={val}: {e}"))
+}
+
+/// `cpu.max` value from the docker inputs. `NanoCpus` (from `--cpus`)
+/// wins when set; otherwise an explicit `--cpu-quota`/`--cpu-period`
+/// pair is honored; otherwise `None` (no `cpu.max` write, so a
+/// `CpuShares` weight can apply instead).
+fn cpu_max_value(nano_cpus: i64, cpu_quota: i64, cpu_period: i64) -> Option<String> {
+    if nano_cpus > 0 {
+        // nano_cpus → "max $quota $period" (period 100ms)
+        let quota = nano_cpus / 100_000; // per 100ms
+        let val = if quota >= 100_000_000 {
+            "max 100000".to_string()
+        } else {
+            format!("{quota} 100000")
+        };
+        return Some(val);
+    }
+    if cpu_quota > 0 {
+        let period = if cpu_period > 0 { cpu_period } else { 100_000 };
+        return Some(format!("{cpu_quota} {period}"));
+    }
+    None
+}
+
+/// `memory.swap.max` value: -1 (unlimited) → "max"; positive →
+/// the cap; 0/negative → the memory limit (daemon default).
+fn swap_max_value(memory_bytes: i64, memory_swap_bytes: i64) -> String {
+    if memory_swap_bytes == -1 {
+        "max".to_string()
+    } else if memory_swap_bytes > 0 {
+        memory_swap_bytes.to_string()
+    } else {
+        memory_bytes.to_string()
+    }
 }
 
 /// docker --cpu-shares 1024..262144 → cgroup v2 weight 1..10000.
@@ -176,6 +266,28 @@ mod tests {
         assert_eq!(shares_to_weight(0), 100);
         assert!(shares_to_weight(1024) > 1 && shares_to_weight(1024) < 300);
         assert!(shares_to_weight(262144) <= 10000);
+    }
+
+    #[test]
+    fn cpu_max_prefers_nano_then_quota() {
+        assert_eq!(
+            cpu_max_value(200_000_000, 0, 0).as_deref(),
+            Some("2000 100000")
+        );
+        assert_eq!(
+            cpu_max_value(0, 50000, 100000).as_deref(),
+            Some("50000 100000")
+        );
+        // Zero period means the kernel default (100ms).
+        assert_eq!(cpu_max_value(0, 25000, 0).as_deref(), Some("25000 100000"));
+        assert_eq!(cpu_max_value(0, 0, 0), None);
+    }
+
+    #[test]
+    fn swap_max_follows_docker_semantics() {
+        assert_eq!(swap_max_value(100, 0), "100");
+        assert_eq!(swap_max_value(100, 200), "200");
+        assert_eq!(swap_max_value(100, -1), "max");
     }
 
     #[test]

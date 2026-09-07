@@ -281,6 +281,23 @@ fn valid_port(p: &str) -> bool {
     p.parse::<u16>().is_ok_and(|n| n > 0)
 }
 
+/// Kernel CPU-list syntax: comma-separated items, each `N` or `N-M`.
+fn valid_cpuset(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    s.split(',').all(|item| {
+        if let Some((lo, hi)) = item.split_once('-') {
+            match (lo.parse::<u32>(), hi.parse::<u32>()) {
+                (Ok(lo), Ok(hi)) => lo <= hi,
+                _ => false,
+            }
+        } else {
+            item.parse::<u32>().is_ok()
+        }
+    })
+}
+
 fn validate_ports(hc: &HostConfig) -> Result<(), CreateError> {
     for (key, bindings) in &hc.PortBindings {
         let (port, proto) = match key.split_once('/') {
@@ -478,18 +495,60 @@ fn validate_net_opts(hc: &HostConfig) -> Result<(), CreateError> {
 ///
 /// | option | status |
 /// |---|---|
-/// | Devices (non-empty) | 400 rejected (Phase 3 implements) |
+/// | Devices (non-empty) | 400 rejected (no device plumbing yet) |
 /// | CapAdd/CapDrop unknown names | 400 rejected |
 /// | CapAdd/CapDrop known names | enforced by child |
 /// | Privileged | enforced by child |
 /// | ReadonlyRootfs | enforced by child |
 /// | User | enforced by child (fail-closed on unknown, unit 1.1b) |
-/// | RestartPolicy name/count | 400 on invalid; supervision in Phase 2 |
+/// | RestartPolicy name/count | 400 on invalid; supervision in manager |
 /// | ShmSize | enforced (/dev/shm sizing); 400 when negative |
 /// | Tmpfs | enforced (tmpfs mounts); 400 on relative dest |
 /// | Sysctls | `net.*` enforced; others 400 rejected |
 /// | Ulimits | core/nofile/nproc/stack/as/memlock enforced; others 400 |
+/// | Memory/NanoCpus/CpuShares | enforced; 400 when negative |
+/// | MemorySwap | enforced (`memory.swap.max`); -1 unlimited, 0 default |
+/// | CpuQuota/CpuPeriod | enforced (`cpu.max` quota/period); 400 when negative |
+/// | CpusetCpus | enforced; 400 on malformed list syntax |
 pub fn validate_hostconfig(hc: &HostConfig) -> Result<(), CreateError> {
+    // Resource magnitudes: negatives are never valid docker input (0 =
+    // unlimited/default). Reject at create instead of silently clamping
+    // to unlimited at start.
+    if hc.Memory < 0 {
+        return Err(CreateError::bad("memory", "must not be negative"));
+    }
+    if hc.NanoCpus < 0 {
+        return Err(CreateError::bad("nano CPUs", "must not be negative"));
+    }
+    if hc.CpuShares < 0 {
+        return Err(CreateError::bad("CPU shares", "must not be negative"));
+    }
+    // MemorySwap: total memory+swap allowance. -1 = unlimited swap,
+    // 0 = daemon default (same as Memory). A positive cap below Memory
+    // is unsatisfiable — fail closed.
+    if hc.MemorySwap < -1 {
+        return Err(CreateError::bad(
+            "memory swap",
+            "must be -1 (unlimited), 0 (default), or a positive byte count",
+        ));
+    }
+    if hc.MemorySwap > 0 && hc.Memory > 0 && hc.MemorySwap < hc.Memory {
+        return Err(CreateError::bad(
+            "memory swap",
+            format!(
+                "swap limit {} is below the memory limit {}",
+                hc.MemorySwap, hc.Memory
+            ),
+        ));
+    }
+    // CpusetCpus: kernel list syntax (`0-3`, `0,2`, ...). The cgroup
+    // write would fail at start with a 500; fail fast with a 400.
+    if !hc.CpusetCpus.is_empty() && !valid_cpuset(&hc.CpusetCpus) {
+        return Err(CreateError::bad(
+            "cpuset CPUs",
+            format!("{:?} is not a valid CPU list", hc.CpusetCpus),
+        ));
+    }
     // Devices: no device-cgroup/plumbing yet (Plan Phase 3) — reject
     // loudly instead of silently running without the device.
     if !hc.Devices.is_empty() {
@@ -577,6 +636,18 @@ pub fn validate_hostconfig(hc: &HostConfig) -> Result<(), CreateError> {
             hc.LogConfig.typ
         )));
     }
+    // json-file opts: only the rotation subset is honored. Anything else
+    // (labels, env, tag, compress, ...) would silently do nothing.
+    for key in hc.LogConfig.config.keys() {
+        if key != "max-size" && key != "max-file" {
+            return Err(CreateError::unsupported(format!(
+                "log opt {key:?} (supported: max-size, max-file)"
+            )));
+        }
+    }
+    if let Err(e) = crate::stdio::parse_log_rotation(&hc.LogConfig.config) {
+        return Err(CreateError::bad("log opt", e));
+    }
     if !hc.IpcMode.is_empty() && hc.IpcMode != "private" && hc.IpcMode != "shareable" {
         return Err(CreateError::unsupported(format!(
             "IpcMode {:?}",
@@ -619,11 +690,13 @@ pub fn validate_hostconfig(hc: &HostConfig) -> Result<(), CreateError> {
     if hc.BlkioWeight != 0 {
         return Err(CreateError::unsupported("HostConfig.BlkioWeight"));
     }
-    if hc.CpuPeriod != 0 {
-        return Err(CreateError::unsupported("HostConfig.CpuPeriod"));
+    // CpuQuota/CpuPeriod are enforced via `cpu.max` (quota/period); only
+    // negatives are invalid.
+    if hc.CpuPeriod < 0 {
+        return Err(CreateError::bad("CPU period", "must not be negative"));
     }
-    if hc.CpuQuota != 0 {
-        return Err(CreateError::unsupported("HostConfig.CpuQuota"));
+    if hc.CpuQuota < 0 {
+        return Err(CreateError::bad("CPU quota", "must not be negative"));
     }
     if !hc.CpusetMems.is_empty() {
         return Err(CreateError::unsupported("HostConfig.CpusetMems"));
@@ -1038,11 +1111,11 @@ mod tests {
         assert!(validate_create(&b, None).is_err());
 
         let mut b = body();
-        b.HostConfig.CpuPeriod = 100000;
+        b.HostConfig.CpuPeriod = -1;
         assert!(validate_create(&b, None).is_err());
 
         let mut b = body();
-        b.HostConfig.CpuQuota = 50000;
+        b.HostConfig.CpuQuota = -1;
         assert!(validate_create(&b, None).is_err());
 
         let mut b = body();
@@ -1068,5 +1141,85 @@ mod tests {
         let mut b = body();
         b.Shell = Some(vec!["/bin/sh".into()]);
         assert!(validate_create(&b, None).is_err());
+    }
+
+    #[test]
+    fn matrix_log_opts_rotation_subset() {
+        use std::collections::HashMap;
+        let mut b = body();
+        b.HostConfig.LogConfig.config =
+            HashMap::from([("max-size".to_string(), "10m".to_string())]);
+        assert!(validate_create(&b, None).is_ok());
+        let mut b = body();
+        b.HostConfig.LogConfig.config = HashMap::from([
+            ("max-size".to_string(), "100k".to_string()),
+            ("max-file".to_string(), "5".to_string()),
+        ]);
+        assert!(validate_create(&b, None).is_ok());
+        // Unknown opts would silently do nothing: explicit 400.
+        let mut b = body();
+        b.HostConfig.LogConfig.config = HashMap::from([("labels".to_string(), "x".to_string())]);
+        let err = validate_create(&b, None).unwrap_err().to_string();
+        assert!(err.contains("log opt"), "unexpected: {err}");
+        let mut b = body();
+        b.HostConfig.LogConfig.config =
+            HashMap::from([("max-size".to_string(), "huge".to_string())]);
+        assert!(validate_create(&b, None).is_err());
+        let mut b = body();
+        b.HostConfig.LogConfig.config = HashMap::from([("max-file".to_string(), "0".to_string())]);
+        assert!(validate_create(&b, None).is_err());
+    }
+
+    #[test]
+    fn matrix_quota_swap_cpuset_enforced() {
+        // Positive CpuQuota/CpuPeriod are enforced via cpu.max, not rejected.
+        let mut b = body();
+        b.HostConfig.CpuQuota = 50000;
+        b.HostConfig.CpuPeriod = 100000;
+        assert!(validate_create(&b, None).is_ok());
+
+        // MemorySwap: -1 (unlimited) and >= Memory pass; below Memory fails.
+        let mut b = body();
+        b.HostConfig.Memory = 256 * 1024 * 1024;
+        b.HostConfig.MemorySwap = -1;
+        assert!(validate_create(&b, None).is_ok());
+        let mut b = body();
+        b.HostConfig.Memory = 256 * 1024 * 1024;
+        b.HostConfig.MemorySwap = 512 * 1024 * 1024;
+        assert!(validate_create(&b, None).is_ok());
+        let mut b = body();
+        b.HostConfig.Memory = 256 * 1024 * 1024;
+        b.HostConfig.MemorySwap = 128 * 1024 * 1024;
+        let err = validate_create(&b, None).unwrap_err().to_string();
+        assert!(err.contains("swap"), "unexpected: {err}");
+        let mut b = body();
+        b.HostConfig.MemorySwap = -2;
+        assert!(validate_create(&b, None).is_err());
+
+        // Negative resource magnitudes fail closed instead of clamping.
+        for set in [
+            |b: &mut ContainerCreateBody| b.HostConfig.Memory = -1,
+            |b: &mut ContainerCreateBody| b.HostConfig.NanoCpus = -1,
+            |b: &mut ContainerCreateBody| b.HostConfig.CpuShares = -1,
+        ] {
+            let mut b = body();
+            set(&mut b);
+            assert!(validate_create(&b, None).is_err());
+        }
+
+        // Cpuset syntax validated at create, not at cgroup-write time.
+        for good in ["0", "0-3", "0,2,4-7"] {
+            let mut b = body();
+            b.HostConfig.CpusetCpus = good.into();
+            assert!(validate_create(&b, None).is_ok(), "cpuset {good:?}");
+        }
+        for bad in ["a", "3-1", "0,,1", "-1", "0-", "1-2-3"] {
+            let mut b = body();
+            b.HostConfig.CpusetCpus = bad.into();
+            assert!(validate_create(&b, None).is_err(), "cpuset {bad:?}");
+        }
+        assert!(valid_cpuset("0-3"));
+        assert!(!valid_cpuset(""));
+        assert!(!valid_cpuset("3-1"));
     }
 }

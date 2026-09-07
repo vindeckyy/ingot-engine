@@ -12,6 +12,36 @@ use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
+/// Close all fds except `keep`. Iterates /proc/self/fd instead of
+/// blindly closing 3..=4096 (usually <50 fds, not 4093 syscalls).
+fn close_all_fds(keep: &[i32]) {
+    if let Ok(rd) = std::fs::read_dir("/proc/self/fd") {
+        let mut to_close = Vec::new();
+        for entry in rd.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if let Ok(fd) = name.parse::<i32>() {
+                    if fd >= 3 && !keep.contains(&fd) {
+                        to_close.push(fd);
+                    }
+                }
+            }
+        }
+        for fd in to_close {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+        return;
+    }
+    for fd in 3..=4096i32 {
+        if !keep.contains(&fd) {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ExecState {
@@ -331,13 +361,10 @@ pub fn start_exec(
                 libc::dup2(in_fd, 0);
                 libc::dup2(out_fd, 1);
                 libc::dup2(err_fd, 2);
-                // Close every inherited daemon fd except stdio.
+                // Close every inherited daemon fd except stdio. Prefer
+                // close_range (single syscall) over ~4093 closes.
                 let keep = [0, 1, 2, in_fd, out_fd, err_fd];
-                for fd in 3..=4096i32 {
-                    if !keep.contains(&fd) {
-                        libc::close(fd);
-                    }
-                }
+                close_all_fds(&keep);
                 // Drop to the container's capability set while fully
                 // privileged: bounding drops need CAP_SETPCAP (unit 3.1).
                 let keep = crate::child::compute_keep(&cap_add, &cap_drop, privileged);
