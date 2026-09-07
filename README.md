@@ -16,12 +16,56 @@ Ingot is a container engine that implements the Docker Engine API (v1.24 through
 
 Ingot has no external runtime dependency on `runc`, `crun`, `youki`, or `libcontainer`. Namespace isolation, cgroups v2 resource control, overlayfs storage, bridge networking, embedded DNS, json-file logging, multiplexed stream hijacking, Dockerfile building, and Compose orchestration are all implemented in-repo.
 
+## Why Ingot
+
+Ingot is not a drop-in replacement for Docker in production. Docker is battle-tested, widely deployed, and backed by a large ecosystem. Ingot is a from-scratch engine that is architecturally simpler in specific ways. Those differences are advantages in specific contexts, and honest about where they are not.
+
+### No external runtime process
+
+Docker's container lifecycle goes through `dockerd` to `containerd` to `runc` (or `crun`), three separate processes communicating over gRPC and OCI bundles. Ingot's `ingotd` calls `clone()` directly and sets up namespaces, cgroups, overlayfs, and capabilities in the same process, then `execve`s the user command. There is no containerd shim, no OCI bundle serialization, no second process to start or lose.
+
+Evidence: `crates/runtime/src/manager.rs:608-617` builds the clone flags. `crates/runtime/src/child.rs:402` performs the `execve`. No `Command::new` or external process spawn exists anywhere in the runtime crate. A grep for `runc`, `crun`, `youki`, or `libcontainer` across all crates returns only comments referencing Docker's architecture for comparison, not calls to those binaries.
+
+### Two binaries, one language
+
+Docker ships `dockerd` (Go), `containerd` (Go), `runc` (Go), and the `docker` CLI (Go), plus optional `rootlesskit`, `vpnkit`, and `buildkit` binaries. Ingot ships two Rust binaries: `ingotd` and `ingot`. The entire workspace is one language, one toolchain, one `cargo build`. No CGO, no cross-language FFI, no separate version matrices.
+
+Evidence: `Cargo.toml` lists 12 workspace crates, all Rust. The only system dependencies are `iptables` and `iproute2` (used for firewall and bridge management, same as Docker).
+
+### Memory safety at the syscall boundary
+
+Container runtimes manipulate kernel namespaces, cgroups, mount tables, and capabilities through raw syscalls. In `runc`, this is Go with `unsafe` CGO-free but garbage-collected code. In Ingot, it is Rust with `unsafe` blocks scoped to individual `libc::` calls. The borrow checker enforces ownership of file descriptors, locks, and child contexts at compile time.
+
+Evidence: `crates/runtime/src/child.rs` contains 27 `unsafe` blocks, each scoped to a single syscall or pointer dereference. `crates/runtime/src/manager.rs` uses `Mutex<ContainerRecord>` and `Mutex<ContainerRuntimeState>` for shared state. No `unsafe` block spans more than a few lines.
+
+### Hard link preservation in image export
+
+Standard tar serialization duplicates hard-linked files. Busybox, for example, has hundreds of applets that are hard links to a single binary. Docker's `save` handles this, but Ingot's implementation tracks `(dev, ino)` pairs to emit POSIX `EntryType::Link` entries, reducing a Busybox image export from hundreds of megabytes of duplicated data to a few megabytes.
+
+Evidence: `crates/server/src/handlers/images.rs:626-658` maintains a `seen_inodes: HashMap<(u64, u64), PathBuf>` keyed by `(dev, ino)`. On a repeat inode, it sets `header.set_entry_type(tar::EntryType::Link)` instead of writing a new file entry.
+
+### Single-process event bus
+
+Docker's event system routes through `containerd`'s event bus and the Docker daemon's subscription layer. Ingot uses a `tokio::sync::broadcast` channel inside `ingotd`. Events flow from the runtime manager, network manager, and volume manager directly to any connected `/events` subscriber. No serialization between processes, no gRPC hop.
+
+Evidence: `crates/store/src/lib.rs` defines the event bus. `crates/server/src/handlers/events.rs` subscribes to the broadcast receiver and streams filtered events directly to the HTTP response.
+
+### What Ingot is not
+
+- **Not production-hardened.** No security audit, no fuzzing campaign, no years of bug reports from real deployments.
+- **Not a feature match.** Docker has BuildKit, rootless mode, plugins, Swarm, multi-platform builds via QEMU, scan integration, and a registry. Ingot has a classic builder, root-only daemon, and no Swarm.
+- **Not ecosystem-compatible.** No Helm charts, no Compose v3 spec extensions beyond what is implemented, no Kubernetes CRI shim.
+- **Not multi-OS.** Linux only, because the runtime uses Linux-specific syscalls (`clone`, `pivot_root`, cgroups v2).
+
+Ingot is a clean-room engine for understanding how container runtimes work, and a base for hardening specific subsystems. If you need to run containers in production, use Docker.
+
 ## Status
 
 Ingot is a from-scratch engine built for learning and hardening. It runs real containers on a disposable Linux host with cgroups v2. It is not production-hardened and has not received a security audit. See [SECURITY.md](SECURITY.md) for the threat model and reporting policy.
 
 ## Table of Contents
 
+- [Why Ingot](#why-ingot)
 - [Architecture](#architecture)
 - [API Coverage](#api-coverage)
 - [Feature Matrix](#feature-matrix)
