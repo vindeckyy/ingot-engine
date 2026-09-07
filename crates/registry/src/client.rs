@@ -736,8 +736,12 @@ impl RegistryClient {
             {
                 Ok(n) => return Ok(n),
                 Err(e) if e.retryable && attempt < MAX_FETCH_ATTEMPTS => {
-                    let wait = e.retry_after.min(blob_backoff(attempt));
-                    tokio::time::sleep(wait).await;
+                    // Honor server Retry-After (don't truncate to backoff):
+                    // wait the max + small jitter to avoid thundering herd.
+                    let base = blob_backoff(attempt);
+                    let wait = e.retry_after.max(base);
+                    let jitter = std::time::Duration::from_millis(attempt as u64 * 97 % 250);
+                    tokio::time::sleep(wait + jitter).await;
                 }
                 Err(e) => return Err(e.source),
             }
@@ -838,7 +842,9 @@ impl RegistryClient {
             .open(&tmp)
             .await
             .map_err(|e| AttemptError::fatal(e.into()))?;
-        let mut writer = HashingWriter::with_hasher(file, hasher, written);
+        // Buffer 256KB to avoid a write(2) per reqwest chunk (MSS-sized).
+        let buffered = tokio::io::BufWriter::with_capacity(256 * 1024, file);
+        let mut writer = HashingWriter::with_hasher(buffered, hasher, written);
         let mut stream = resp.bytes_stream();
         loop {
             let next = tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next()).await;
@@ -957,6 +963,28 @@ fn platform_matches(entry: &IndexEntry, want_os: &str, want_arch: &str) -> bool 
         .unwrap_or(false)
 }
 
+/// Parse a manifest body and, for an index document, select the platform
+/// entry. Returns the selected manifest digest, or `None` for a single
+/// (non-index) manifest. Pure over the body: safe to fuzz without a
+/// registry (Plan Phase 12, unit 12.2).
+pub fn select_index_digest(
+    body: &[u8],
+    want_os: &str,
+    want_arch: &str,
+) -> anyhow::Result<Option<String>> {
+    let raw: RawManifest = serde_json::from_slice(body).context("parse manifest")?;
+    if raw.manifests.is_empty() {
+        return Ok(None);
+    }
+    let entry = pick_platform(&raw.manifests, want_os, want_arch).ok_or_else(|| {
+        anyhow!(
+            "no {want_os}/{want_arch} manifest in index (available: {})",
+            available_platforms(&raw.manifests)
+        )
+    })?;
+    Ok(Some(entry.digest))
+}
+
 fn pick_platform(entries: &[IndexEntry], want_os: &str, want_arch: &str) -> Option<IndexEntry> {
     // Exact match only: pulling a foreign-arch image would fail at exec
     // time, so a missing platform is a clear error, not a silent fallback.
@@ -1066,6 +1094,533 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         format!("{}…", &s[..n])
     }
+}
+
+/// Push helpers (unit 4.6): blob upload (POST initiate + PUT to the
+/// returned Location, or monolithic POST) and manifest PUT for a single
+/// image manifest. Pushes always address the canonical endpoint (mirrors
+/// are pull-only) and authenticate with a `pull,push` scope, the way the
+/// docker engine does. Retry/backoff/auth helpers are shared with pull.
+impl RegistryClient {
+    /// Token scope for pushes: pull (blob-existence HEADs) plus push.
+    fn push_scope(image: &ImageRef) -> String {
+        format!("repository:{}:pull,push", image.api_repo())
+    }
+
+    /// HEAD a blob on the canonical endpoint. `true` means the registry
+    /// already holds it, so the upload is skipped ("Layer already exists").
+    pub async fn blob_exists(
+        &self,
+        image: &ImageRef,
+        digest: &str,
+        auth: Option<&AuthConfig>,
+    ) -> Result<bool> {
+        let endpoint = Self::endpoint(image);
+        let path = format!("/v2/{}/blobs/{}", image.api_repo(), digest);
+        let scope = Self::push_scope(image);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match self
+                .push_request(
+                    &endpoint,
+                    reqwest::Method::HEAD,
+                    &path,
+                    None,
+                    None,
+                    auth,
+                    &scope,
+                    None,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return Ok(true);
+                    }
+                    if status == reqwest::StatusCode::NOT_FOUND {
+                        return Ok(false);
+                    }
+                    if (status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error())
+                        && attempt < MAX_FETCH_ATTEMPTS
+                    {
+                        tokio::time::sleep(blob_backoff(attempt)).await;
+                        continue;
+                    }
+                    let body = read_error_body(resp).await;
+                    return Err(push_error(status.as_u16(), &body, digest));
+                }
+                Err(e) if e.retryable && attempt < MAX_FETCH_ATTEMPTS => {
+                    tokio::time::sleep(e.retry_after.max(blob_backoff(attempt))).await;
+                }
+                Err(e) => return Err(e.source),
+            }
+        }
+    }
+
+    /// Upload a blob from memory. Returns `true` when bytes were sent,
+    /// `false` when the registry already held the digest (HEAD hit).
+    pub async fn push_blob_bytes(
+        &self,
+        image: &ImageRef,
+        digest: &str,
+        bytes: Vec<u8>,
+        auth: Option<&AuthConfig>,
+    ) -> Result<bool> {
+        let body = PushBody::Bytes(bytes);
+        self.push_blob(image, digest, &body, auth).await
+    }
+
+    /// Upload a blob by streaming the file at `path` in chunks (blobs are
+    /// too large to buffer in memory). Returns `true` when bytes were
+    /// sent, `false` when the registry already held the digest.
+    pub async fn push_blob_file(
+        &self,
+        image: &ImageRef,
+        digest: &str,
+        path: &Path,
+        auth: Option<&AuthConfig>,
+    ) -> Result<bool> {
+        let body = PushBody::File(path.to_path_buf());
+        self.push_blob(image, digest, &body, auth).await
+    }
+
+    async fn push_blob(
+        &self,
+        image: &ImageRef,
+        digest: &str,
+        body: &PushBody,
+        auth: Option<&AuthConfig>,
+    ) -> Result<bool> {
+        if self.blob_exists(image, digest, auth).await? {
+            return Ok(false);
+        }
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match self.push_blob_attempt(image, digest, body, auth).await {
+                Ok(()) => return Ok(true),
+                Err(e) if e.retryable && attempt < MAX_FETCH_ATTEMPTS => {
+                    tokio::time::sleep(e.retry_after.max(blob_backoff(attempt))).await;
+                }
+                Err(e) => return Err(e.source),
+            }
+        }
+    }
+
+    /// One blob upload: POST initiate, then PUT the bytes to the returned
+    /// Location (with `?digest=`); falls back to a monolithic POST when
+    /// the registry answers initiate without a usable Location.
+    async fn push_blob_attempt(
+        &self,
+        image: &ImageRef,
+        digest: &str,
+        body: &PushBody,
+        auth: Option<&AuthConfig>,
+    ) -> Result<(), AttemptError> {
+        let endpoint = Self::endpoint(image);
+        let scope = Self::push_scope(image);
+        // Fail fast on an unreadable blob before touching the network.
+        body.len().map_err(AttemptError::fatal)?;
+        let init_path = format!("/v2/{}/blobs/uploads/", image.api_repo());
+        let init = self
+            .push_request(
+                &endpoint,
+                reqwest::Method::POST,
+                &init_path,
+                None,
+                None,
+                auth,
+                &scope,
+                None,
+            )
+            .await?;
+        let status = init.status();
+        if status == reqwest::StatusCode::CREATED {
+            // Monolithic registries answer initiate with 201 already.
+            return Ok(());
+        }
+        if status == reqwest::StatusCode::ACCEPTED {
+            if let Some(location) = init
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+            {
+                let url = with_digest_query(&resolve_location(&endpoint, &location), digest);
+                let put = self
+                    .push_request(
+                        &endpoint,
+                        reqwest::Method::PUT,
+                        &url,
+                        None,
+                        Some("application/octet-stream"),
+                        auth,
+                        &scope,
+                        Some(body),
+                    )
+                    .await?;
+                return push_blob_put_outcome(put, digest).await;
+            }
+            // 202 without a Location: fall through to the monolithic POST.
+        }
+        if status.is_success() {
+            return Err(AttemptError::fatal(anyhow!(
+                "blob {digest}: unexpected initiate status {status}"
+            )));
+        }
+        // No usable Location (or initiate rejected): monolithic POST with
+        // the digest in the query carries the whole blob at once.
+        if status == reqwest::StatusCode::ACCEPTED
+            || status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        {
+            let mono_path = format!("/v2/{}/blobs/uploads/?digest={digest}", image.api_repo());
+            let mono = self
+                .push_request(
+                    &endpoint,
+                    reqwest::Method::POST,
+                    &mono_path,
+                    None,
+                    Some("application/octet-stream"),
+                    auth,
+                    &scope,
+                    Some(body),
+                )
+                .await?;
+            let mono_status = mono.status();
+            if mono_status == reqwest::StatusCode::CREATED
+                || mono_status == reqwest::StatusCode::ACCEPTED
+            {
+                return Ok(());
+            }
+            return Err(classify_push_status(mono, digest).await);
+        }
+        Err(classify_push_status(init, digest).await)
+    }
+
+    /// PUT a single image manifest (manifest-list/index pushes stay out:
+    /// the daemon pushes exactly the platform it stored). Returns the
+    /// registry-confirmed manifest digest.
+    pub async fn push_manifest(
+        &self,
+        image: &ImageRef,
+        reference: &str,
+        media_type: &str,
+        body: &[u8],
+        auth: Option<&AuthConfig>,
+    ) -> Result<String> {
+        let computed = format!("sha256:{}", hex::encode(sha2::Sha256::digest(body)));
+        let endpoint = Self::endpoint(image);
+        let scope = Self::push_scope(image);
+        let path = format!("/v2/{}/manifests/{reference}", image.api_repo());
+        // Retained across attempts: each send rebuilds its `reqwest::Body`
+        // from these bytes (see `PushBody`).
+        let req_body = PushBody::Bytes(body.to_vec());
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match self
+                .push_request(
+                    &endpoint,
+                    reqwest::Method::PUT,
+                    &path,
+                    None,
+                    Some(media_type),
+                    auth,
+                    &scope,
+                    Some(&req_body),
+                )
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        let header = resp
+                            .headers()
+                            .get("Docker-Content-Digest")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        if let Some(h) = header {
+                            if h != computed {
+                                return Err(anyhow!(
+                                    "Docker-Content-Digest {h} does not match pushed manifest {computed}"
+                                ));
+                            }
+                            return Ok(h);
+                        }
+                        return Ok(computed);
+                    }
+                    if (status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error())
+                        && attempt < MAX_FETCH_ATTEMPTS
+                    {
+                        let wait = retry_after_secs(resp.headers());
+                        let _ = read_error_body(resp).await;
+                        tokio::time::sleep(wait.max(blob_backoff(attempt))).await;
+                        continue;
+                    }
+                    let err_body = read_error_body(resp).await;
+                    return Err(push_error(status.as_u16(), &err_body, reference));
+                }
+                Err(e) if e.retryable && attempt < MAX_FETCH_ATTEMPTS => {
+                    tokio::time::sleep(e.retry_after.max(blob_backoff(attempt))).await;
+                }
+                Err(e) => return Err(e.source),
+            }
+        }
+    }
+
+    /// Send one push request with the Bearer/Basic challenge dance. Like
+    /// [`Self::authed_request`] but with an explicit `pull,push` scope, an
+    /// optional content type, and a re-readable body (the 401 retry must
+    /// resend it). `url_or_path` accepts an absolute upload Location too.
+    // Eight params by design: one push transport for every verb/shape
+    // beats a separate helper per call site.
+    #[allow(clippy::too_many_arguments)]
+    async fn push_request(
+        &self,
+        endpoint: &str,
+        method: reqwest::Method,
+        url_or_path: &str,
+        accept: Option<&str>,
+        content_type: Option<&str>,
+        auth: Option<&AuthConfig>,
+        scope: &str,
+        body: Option<&PushBody>,
+    ) -> Result<reqwest::Response, AttemptError> {
+        let url = if url_or_path.starts_with("http://") || url_or_path.starts_with("https://") {
+            url_or_path.to_string()
+        } else {
+            format!("{endpoint}{url_or_path}")
+        };
+        // The body rebuilds per send: `reqwest::Body` is single-shot, but
+        // the 401 retry below must resend it (see `PushBody`).
+        let build = |bearer: Option<&str>, basic: Option<&String>| {
+            let mut req = self.http.request(method.clone(), &url);
+            if let Some(a) = accept {
+                req = req.header(reqwest::header::ACCEPT, a);
+            }
+            if let Some(c) = content_type {
+                req = req.header(reqwest::header::CONTENT_TYPE, c);
+            }
+            if let Some(b) = bearer {
+                req = req.bearer_auth(b);
+            }
+            if let Some(b) = basic {
+                req = req.header(reqwest::header::AUTHORIZATION, b);
+            }
+            push_body_request(req, body).map_err(AttemptError::fatal)
+        };
+        // Sends resolve at response headers; upload bodies stream
+        // afterwards, so this bounds handshakes without cutting blobs short.
+        let resp = tokio::time::timeout(METADATA_TIMEOUT, build(None, None)?.send())
+            .await
+            .map_err(anyhow::Error::new)
+            .and_then(|r| r.map_err(|e| with_transport_hint(format!("{method} {url}"), e)))
+            .map_err(AttemptError::transport)?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+        let header = resp
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| AttemptError::fatal(anyhow!("401 without WWW-Authenticate from {url}")))?
+            .to_string();
+        match Self::parse_challenge(&header).map_err(AttemptError::fatal)? {
+            Challenge::Bearer {
+                realm,
+                service,
+                scope: _,
+            } => {
+                // Pushes always mint `pull,push`: the challenge scope names
+                // what the endpoint guards, not what the push needs.
+                let token = self
+                    .bearer_token(scope, &realm, &service, auth)
+                    .await
+                    .map_err(AttemptError::transport)?;
+                tokio::time::timeout(METADATA_TIMEOUT, build(Some(&token), None)?.send())
+                    .await
+                    .map_err(anyhow::Error::new)
+                    .and_then(|r| {
+                        r.map_err(|e| with_transport_hint(format!("{method} {url} (authed)"), e))
+                    })
+                    .map_err(AttemptError::transport)
+            }
+            Challenge::Basic => {
+                let basic = auth
+                    .filter(|a| !a.username.is_empty())
+                    .map(Self::basic_auth_value);
+                build(None, basic.as_ref())?
+                    .send()
+                    .await
+                    .map_err(|e| AttemptError::transport(e.into()))
+            }
+        }
+    }
+}
+
+/// Re-readable upload body: `reqwest::Body` is single-shot, but the 401
+/// auth retry must resend it, so push requests rebuild the body per send.
+enum PushBody {
+    Bytes(Vec<u8>),
+    File(std::path::PathBuf),
+}
+
+impl PushBody {
+    fn len(&self) -> Result<u64> {
+        match self {
+            PushBody::Bytes(b) => Ok(b.len() as u64),
+            PushBody::File(p) => Ok(std::fs::metadata(p)
+                .with_context(|| format!("stat upload {}", p.display()))?
+                .len()),
+        }
+    }
+}
+
+/// Attach the body to a request builder. Files stream in 128KB chunks so
+/// multi-gigabyte layers never sit in memory at once.
+fn push_body_request(
+    builder: reqwest::RequestBuilder,
+    body: Option<&PushBody>,
+) -> Result<reqwest::RequestBuilder> {
+    let Some(src) = body else {
+        return Ok(builder);
+    };
+    let len = src.len()?;
+    match src {
+        PushBody::Bytes(b) => Ok(builder
+            .header(reqwest::header::CONTENT_LENGTH, len)
+            .body(b.clone())),
+        PushBody::File(path) => {
+            let file = std::fs::File::open(path)
+                .with_context(|| format!("open upload {}", path.display()))?;
+            let file = tokio::fs::File::from_std(file);
+            // The open file is the fold state: each poll reads one chunk
+            // and hands the file back for the next poll.
+            let stream = futures::stream::unfold(file, |mut file| async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 128 * 1024];
+                match file.read(&mut buf).await {
+                    Ok(0) => None,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Some((Ok::<bytes::Bytes, anyhow::Error>(buf.into()), file))
+                    }
+                    Err(e) => Some((Err(anyhow::Error::new(e)), file)),
+                }
+            });
+            Ok(builder
+                .header(reqwest::header::CONTENT_LENGTH, len)
+                .body(reqwest::Body::wrap_stream(stream)))
+        }
+    }
+}
+
+/// Classify a failed blob-upload PUT: 429/5xx retry (honoring
+/// Retry-After), anything else a fatal Docker-shaped error.
+async fn push_blob_put_outcome(resp: reqwest::Response, digest: &str) -> Result<(), AttemptError> {
+    let status = resp.status();
+    if status == reqwest::StatusCode::CREATED || status == reqwest::StatusCode::ACCEPTED {
+        return Ok(());
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        let wait = retry_after_secs(resp.headers());
+        let body = read_error_body(resp).await;
+        return Err(AttemptError::retryable_after(
+            anyhow!(
+                "blob {digest} upload failed ({status}): {}",
+                truncate(&body, 300)
+            ),
+            wait,
+        ));
+    }
+    Err(classify_push_status(resp, digest).await)
+}
+
+/// Drain an error body with a bound; stalls degrade to empty rather than
+/// wedging the push.
+async fn read_error_body(resp: reqwest::Response) -> String {
+    tokio::time::timeout(METADATA_TIMEOUT, resp.text())
+        .await
+        .map(|r| r.unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// Fatal push failure for a finished response: 429/5xx retry, else a
+/// Docker-shaped error naming the registry's `errors[].message`.
+async fn classify_push_status(resp: reqwest::Response, what: &str) -> AttemptError {
+    let status = resp.status();
+    let wait = retry_after_secs(resp.headers());
+    let body = read_error_body(resp).await;
+    let err = push_error(status.as_u16(), &body, what);
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        AttemptError::retryable_after(err, wait)
+    } else {
+        AttemptError::fatal(err)
+    }
+}
+
+/// Resolve an upload Location: absolute URLs pass through, relative ones
+/// hang off the endpoint that issued them.
+fn resolve_location(endpoint: &str, location: &str) -> String {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        location.to_string()
+    } else if let Some(rest) = location.strip_prefix('/') {
+        format!("{endpoint}/{rest}")
+    } else {
+        format!("{endpoint}/{location}")
+    }
+}
+
+/// Append `?digest=` to an upload URL unless it already carries one (some
+/// registries embed the digest in the Location they return).
+fn with_digest_query(url: &str, digest: &str) -> String {
+    if url.contains("digest=") {
+        url.to_string()
+    } else if url.contains('?') {
+        format!("{url}&digest={digest}")
+    } else {
+        format!("{url}?digest={digest}")
+    }
+}
+
+fn push_error(status: u16, body: &str, what: &str) -> anyhow::Error {
+    // Auth failures stay actionable and credential-free, mirroring
+    // `manifest_error`: never echo tokens, passwords, or auth headers.
+    if status == 401 {
+        return anyhow!(
+            "unauthorized for {what}: bad or missing credentials (check `docker login` for this registry)"
+        );
+    }
+    if status == 403 {
+        return anyhow!("denied for {what}: the credentials lack push access to this repository");
+    }
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body.as_bytes()) {
+        if let Some(errors) = v.get("errors").and_then(|e| e.as_array()) {
+            let msgs: Vec<String> = errors
+                .iter()
+                .filter_map(|e| {
+                    let code = e.get("code").and_then(|c| c.as_str()).unwrap_or("");
+                    let msg = e.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                    if code.is_empty() && msg.is_empty() {
+                        None
+                    } else if msg.is_empty() {
+                        Some(code.to_string())
+                    } else {
+                        Some(format!("{code}: {msg}"))
+                    }
+                })
+                .collect();
+            if !msgs.is_empty() {
+                return anyhow!("push of {what} failed ({status}): {}", msgs.join("; "));
+            }
+        }
+    }
+    anyhow!("push of {what} failed ({status}): {}", truncate(body, 300))
 }
 
 fn pct_encode(s: &str) -> String {
@@ -1225,6 +1780,101 @@ mod tests {
         assert!(e.contains("may require authorization"), "{e}");
         // Other failures truncate the body.
         let e = manifest_error(500, &"x".repeat(1000), &img()).to_string();
+        assert!(e.len() < 600, "body must be truncated: {}", e.len());
+    }
+
+    #[test]
+    fn select_index_digest_matrix() {
+        // Single manifest → None (caller proceeds without a sub-fetch).
+        let single = br#"{"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:abc"},"layers":[]}"#;
+        assert_eq!(select_index_digest(single, "linux", "amd64").unwrap(), None);
+        // Index → exact platform digest.
+        let index = br#"{"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[
+            {"mediaType":"m","digest":"sha256:arm","platform":{"os":"linux","architecture":"arm64"}},
+            {"mediaType":"m","digest":"sha256:x86","platform":{"os":"linux","architecture":"amd64"}}
+        ]}"#;
+        assert_eq!(
+            select_index_digest(index, "linux", "amd64").unwrap(),
+            Some("sha256:x86".to_string())
+        );
+        // Missing platform names the available set.
+        let err = select_index_digest(index, "linux", "s390x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("amd64") && err.contains("arm64"), "{err}");
+        // Garbage fails closed.
+        assert!(select_index_digest(b"not json", "linux", "amd64").is_err());
+        assert!(select_index_digest(b"[1,2]", "linux", "amd64").is_err());
+    }
+
+    #[test]
+    fn push_scope_names_pull_and_push() {
+        let r = ImageRef::parse("quay.io/team/app:1.0").unwrap();
+        assert_eq!(
+            RegistryClient::push_scope(&r),
+            "repository:team/app:pull,push"
+        );
+        let busy = ImageRef::parse("busybox:latest").unwrap();
+        assert_eq!(
+            RegistryClient::push_scope(&busy),
+            "repository:library/busybox:pull,push"
+        );
+    }
+
+    #[test]
+    fn upload_location_resolution() {
+        assert_eq!(
+            resolve_location("http://h:5000", "http://other/x"),
+            "http://other/x"
+        );
+        assert_eq!(
+            resolve_location("http://h:5000", "/v2/a/blobs/uploads/1"),
+            "http://h:5000/v2/a/blobs/uploads/1"
+        );
+        assert_eq!(
+            resolve_location("http://h:5000", "v2/a/blobs/uploads/1"),
+            "http://h:5000/v2/a/blobs/uploads/1"
+        );
+    }
+
+    #[test]
+    fn digest_query_append_rules() {
+        assert_eq!(
+            with_digest_query("/up/1", "sha256:abc"),
+            "/up/1?digest=sha256:abc"
+        );
+        assert_eq!(
+            with_digest_query("/up/1?x=1", "sha256:abc"),
+            "/up/1?x=1&digest=sha256:abc"
+        );
+        // Registries that embed the digest keep their own value.
+        assert_eq!(
+            with_digest_query("/up/1?digest=sha256:mine", "sha256:other"),
+            "/up/1?digest=sha256:mine"
+        );
+    }
+
+    #[test]
+    fn push_failures_are_docker_shaped_and_redacted() {
+        // 401/403 map to login guidance, never echoing bodies or secrets.
+        for (status, needle) in [(401u16, "docker login"), (403u16, "push access")] {
+            let e = push_error(status, r#"{"errors":[{"code":"DENIED"}]}"#, "repo:tag").to_string();
+            assert!(e.contains(needle), "{status}: {e}");
+            assert!(!e.contains("DENIED"), "{status} must not echo body: {e}");
+        }
+        // Registry error objects surface code + message.
+        let e = push_error(
+            400,
+            r#"{"errors":[{"code":"BLOB_UNKNOWN","message":"blob unknown to registry"}]}"#,
+            "sha256:abc",
+        )
+        .to_string();
+        assert!(
+            e.contains("BLOB_UNKNOWN") && e.contains("blob unknown"),
+            "{e}"
+        );
+        // Other failures truncate the body.
+        let e = push_error(500, &"x".repeat(1000), "repo:tag").to_string();
         assert!(e.len() < 600, "body must be truncated: {}", e.len());
     }
 

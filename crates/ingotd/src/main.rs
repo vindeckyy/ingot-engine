@@ -7,23 +7,37 @@ use ingot_store::{paths::DataPaths, DaemonLock};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Built-in defaults (used when neither flag nor config file sets a value).
+const DEFAULT_DATA_ROOT: &str = "/var/lib/ingot";
+const DEFAULT_RUN_ROOT: &str = "/run/ingot";
+const DEFAULT_SOCKET: &str = "/run/ingot/ingot.sock";
+const DEFAULT_BRIDGE: &str = "ingot0";
+
 #[derive(Parser, Debug)]
 #[command(name = "ingotd", about = "Ingot container engine daemon", version)]
 struct Args {
     /// Data root (docker's --data-root).
-    #[arg(long, default_value = "/var/lib/ingot")]
-    data_root: PathBuf,
+    #[arg(long)]
+    data_root: Option<PathBuf>,
     /// Runtime state root (exec-root).
-    #[arg(long, default_value = "/run/ingot")]
-    run_root: PathBuf,
+    #[arg(long)]
+    run_root: Option<PathBuf>,
     /// Socket path (docker's --host unix://...).
-    #[arg(long, default_value = "/run/ingot/ingot.sock")]
-    socket: PathBuf,
+    #[arg(long)]
+    socket: Option<PathBuf>,
     #[arg(long)]
     debug: bool,
     /// Default bridge interface name.
-    #[arg(long, default_value = "ingot0")]
-    bridge: String,
+    #[arg(long)]
+    bridge: Option<String>,
+    /// Enable IPv6 dual-stack: every bridge network gets a ULA /64
+    /// alongside its v4 subnet (docker's --ipv6).
+    #[arg(long)]
+    ipv6: bool,
+    /// IPv6 ULA pool carved into per-network /64s (docker's
+    /// --fixed-cidr-v6).
+    #[arg(long)]
+    fixed_cidr_v6: Option<String>,
     /// Group owner for the Unix socket (e.g. "docker" or "ingot"). Defaults to
     /// root-only access (mode 0600).
     ///
@@ -31,6 +45,10 @@ struct Args {
     /// privileges on the host.
     #[arg(long)]
     socket_group: Option<String>,
+    /// Path to a JSON config file (docker's daemon.json equivalent).
+    /// Precedence: CLI flag > config file > built-in default.
+    #[arg(long)]
+    config: Option<PathBuf>,
     /// Verify image-store consistency (read-only) and exit.
     #[arg(long)]
     fsck: bool,
@@ -38,6 +56,87 @@ struct Args {
     /// and unreferenced blobs; refuses while the daemon is live), then exit.
     #[arg(long)]
     repair: bool,
+}
+
+/// File counterpart of [`Args`] (keys use the same kebab-case names as
+/// the flags). Unknown keys are rejected: a typo must fail at boot,
+/// never silently fall back to a default.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct FileConfig {
+    #[serde(default)]
+    data_root: Option<PathBuf>,
+    #[serde(default)]
+    run_root: Option<PathBuf>,
+    #[serde(default)]
+    socket: Option<PathBuf>,
+    #[serde(default)]
+    debug: Option<bool>,
+    #[serde(default)]
+    bridge: Option<String>,
+    #[serde(default)]
+    ipv6: Option<bool>,
+    #[serde(default)]
+    fixed_cidr_v6: Option<String>,
+    #[serde(default)]
+    socket_group: Option<String>,
+}
+
+/// Effective daemon configuration after flag > file > default merge.
+#[derive(Debug, PartialEq)]
+struct EffectiveConfig {
+    data_root: PathBuf,
+    run_root: PathBuf,
+    socket: PathBuf,
+    debug: bool,
+    bridge: String,
+    ipv6: bool,
+    fixed_cidr_v6: String,
+    socket_group: Option<String>,
+}
+
+fn load_file_config(path: &std::path::Path) -> Result<FileConfig> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read config file {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("parse config file {} as JSON", path.display()))
+}
+
+fn resolve_config(args: &Args) -> Result<EffectiveConfig> {
+    let file = match &args.config {
+        Some(p) => load_file_config(p)?,
+        None => FileConfig::default(),
+    };
+    Ok(EffectiveConfig {
+        data_root: args
+            .data_root
+            .clone()
+            .or(file.data_root)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_ROOT)),
+        run_root: args
+            .run_root
+            .clone()
+            .or(file.run_root)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_RUN_ROOT)),
+        socket: args
+            .socket
+            .clone()
+            .or(file.socket)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET)),
+        debug: args.debug || file.debug.unwrap_or(false),
+        bridge: args
+            .bridge
+            .clone()
+            .or(file.bridge)
+            .unwrap_or_else(|| DEFAULT_BRIDGE.to_string()),
+        ipv6: args.ipv6 || file.ipv6.unwrap_or(false),
+        fixed_cidr_v6: args
+            .fixed_cidr_v6
+            .clone()
+            .or(file.fixed_cidr_v6)
+            .unwrap_or_else(|| ingot_network::DEFAULT_FIXED_CIDR_V6.to_string()),
+        socket_group: args.socket_group.clone().or(file.socket_group),
+    })
 }
 
 fn init_logging(debug: bool) {
@@ -57,7 +156,8 @@ fn init_logging(debug: bool) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    init_logging(args.debug);
+    let cfg = resolve_config(&args)?;
+    init_logging(cfg.debug);
 
     // The daemon manipulates mounts, namespaces, cgroups, netlink and iptables.
     if !nix::unistd::Uid::effective().is_root() {
@@ -67,19 +167,19 @@ async fn main() -> Result<()> {
         );
     }
 
-    let paths = DataPaths::new(&args.data_root, &args.run_root);
+    let paths = DataPaths::new(&cfg.data_root, &cfg.run_root);
     if args.fsck || args.repair {
         let _lock = if args.repair {
             // Image repair modifies the store; refuse if daemon is live
             Some(
-                DaemonLock::acquire(&args.data_root, &args.run_root)
+                DaemonLock::acquire(&cfg.data_root, &cfg.run_root)
                     .context("cannot repair image store while ingotd is running")?,
             )
         } else {
             None
         };
         let report = if args.repair {
-            ingot_image::fsck::repair(&paths, &args.run_root)?
+            ingot_image::fsck::repair(&paths, &cfg.run_root)?
         } else {
             ingot_image::fsck::check(&paths)?
         };
@@ -92,7 +192,7 @@ async fn main() -> Result<()> {
     }
 
     // Acquire exclusive daemon lock on data_root and run_root before proceeding
-    let _daemon_lock = DaemonLock::acquire(&args.data_root, &args.run_root)?;
+    let _daemon_lock = DaemonLock::acquire(&cfg.data_root, &cfg.run_root)?;
 
     paths.create_all().context("initialise data root")?;
     paths
@@ -100,14 +200,18 @@ async fn main() -> Result<()> {
         .context("data-root schema check")?;
 
     let config = DaemonConfig {
-        debug: args.debug,
-        default_bridge_name: args.bridge.clone(),
+        debug: cfg.debug,
+        default_bridge_name: cfg.bridge.clone(),
         ..Default::default()
     };
     let mut daemon = DaemonState::new(paths.clone(), config)?;
 
     // Boot self-check: fail fast with actionable errors.
     check_environment(&paths)?;
+
+    // Warm cgroup controllers once so per-container start skips the
+    // cgroup.controllers read + subtree_control write.
+    ingot_runtime::cgroup::Cgroup::ensure_controllers();
 
     // Container manager (M2) — networking attaches in M3.
     let containers = Arc::new(ingot_runtime::ContainerManager::new(
@@ -118,6 +222,17 @@ async fn main() -> Result<()> {
     *containers.self_ref.write().unwrap() = Some(Arc::downgrade(&containers));
     // Network manager (M3) — bridge, IPAM, NAT, DNS.
     let networks = Arc::new(ingot_network::NetworkManager::new(paths.clone())?);
+    // Dual-stack must be configured before boot carves the bridges.
+    // A bad pool fails fast with a docker-shaped error.
+    networks
+        .set_ipv6_config(cfg.ipv6, &cfg.fixed_cidr_v6)
+        .await
+        .with_context(|| {
+            format!(
+                "invalid IPv6 configuration (--ipv6/--fixed-cidr-v6 {:?})",
+                cfg.fixed_cidr_v6
+            )
+        })?;
     networks.boot().await?;
     *containers.net.write().unwrap() = Some(networks.clone());
     daemon.networks = Some(networks);
@@ -136,10 +251,10 @@ async fn main() -> Result<()> {
         "ingotd {} starting: data-root={} socket={}",
         ingot_api::ENGINE_VERSION,
         paths.root.display(),
-        args.socket.display()
+        cfg.socket.display()
     );
 
-    ingot_server::serve::serve(state, &args.socket, args.socket_group.as_deref()).await
+    ingot_server::serve::serve(state, &cfg.socket, cfg.socket_group.as_deref()).await
 }
 
 /// On boot: stale "running" containers died with the daemon. Supervised
@@ -361,4 +476,124 @@ fn try_overlay_mount(tmp: &std::path::Path) -> bool {
         .arg("overlay")
         .status();
     mount_overlay(&opts) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args() -> Args {
+        Args {
+            data_root: None,
+            run_root: None,
+            socket: None,
+            debug: false,
+            bridge: None,
+            ipv6: false,
+            fixed_cidr_v6: None,
+            socket_group: None,
+            config: None,
+            fsck: false,
+            repair: false,
+        }
+    }
+
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn write_config(name: &str, body: &str) -> PathBuf {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "ingot-daemon-{name}-{}-{n}.json",
+            std::process::id()
+        ));
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn config_defaults_without_file() {
+        let cfg = resolve_config(&args()).unwrap();
+        assert_eq!(cfg.data_root, PathBuf::from(DEFAULT_DATA_ROOT));
+        assert_eq!(cfg.run_root, PathBuf::from(DEFAULT_RUN_ROOT));
+        assert_eq!(cfg.socket, PathBuf::from(DEFAULT_SOCKET));
+        assert!(!cfg.debug);
+        assert_eq!(cfg.bridge, DEFAULT_BRIDGE);
+        assert!(!cfg.ipv6);
+        assert_eq!(cfg.fixed_cidr_v6, ingot_network::DEFAULT_FIXED_CIDR_V6);
+        assert_eq!(cfg.socket_group, None);
+    }
+
+    #[test]
+    fn config_ipv6_flag_file_precedence() {
+        // File enables dual-stack with a custom pool.
+        let p = write_config("v6", r#"{"ipv6": true, "fixed-cidr-v6": "fd00:db8::/48"}"#);
+        let mut a = args();
+        a.config = Some(p.clone());
+        let cfg = resolve_config(&a).unwrap();
+        assert!(cfg.ipv6);
+        assert_eq!(cfg.fixed_cidr_v6, "fd00:db8::/48");
+        let _ = std::fs::remove_file(&p);
+        // Flag overrides the file pool; --ipv6 stays opt-in OR.
+        let p = write_config("v6b", r#"{"fixed-cidr-v6": "fd00:db8::/48"}"#);
+        let mut a = args();
+        a.config = Some(p.clone());
+        a.fixed_cidr_v6 = Some("fd00:1::/48".into());
+        a.ipv6 = true;
+        let cfg = resolve_config(&a).unwrap();
+        assert!(cfg.ipv6);
+        assert_eq!(cfg.fixed_cidr_v6, "fd00:1::/48");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn config_file_values_apply() {
+        let p = write_config(
+            "values",
+            r#"{"data-root": "/tmp/d", "socket-group": "ingot", "debug": true, "bridge": "br9"}"#,
+        );
+        let mut a = args();
+        a.config = Some(p.clone());
+        let cfg = resolve_config(&a).unwrap();
+        assert_eq!(cfg.data_root, PathBuf::from("/tmp/d"));
+        assert_eq!(cfg.socket_group.as_deref(), Some("ingot"));
+        assert!(cfg.debug);
+        assert_eq!(cfg.bridge, "br9");
+        // Untouched keys keep built-in defaults.
+        assert_eq!(cfg.run_root, PathBuf::from(DEFAULT_RUN_ROOT));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn config_flag_beats_file() {
+        let p = write_config("x", r#"{"bridge": "br-file", "debug": true}"#);
+        let mut a = args();
+        a.config = Some(p.clone());
+        a.bridge = Some("br-flag".into());
+        let cfg = resolve_config(&a).unwrap();
+        assert_eq!(cfg.bridge, "br-flag");
+        assert!(cfg.debug);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn config_rejects_unknown_keys_and_bad_json() {
+        let p = write_config("x", r#"{"bridges": "typo"}"#);
+        let mut a = args();
+        a.config = Some(p.clone());
+        let err = resolve_config(&a).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("bridges"), "unexpected: {msg}");
+        let _ = std::fs::remove_file(&p);
+
+        let p = write_config("x", r#"{"debug": tru}"#);
+        let mut a = args();
+        a.config = Some(p.clone());
+        assert!(resolve_config(&a).is_err());
+        let _ = std::fs::remove_file(&p);
+
+        // An explicit but missing file is an error, never silent defaults.
+        let mut a = args();
+        a.config = Some(std::env::temp_dir().join("ingot-no-such-config.json"));
+        assert!(resolve_config(&a).is_err());
+    }
 }

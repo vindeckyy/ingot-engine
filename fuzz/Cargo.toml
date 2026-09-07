@@ -11,6 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+ingot-api = { path = "../crates/api" }
 ingot-builder = { path = "../crates/builder" }
 ingot-registry = { path = "../crates/registry" }
 ingot-image = { path = "../crates/image" }
@@ -33,5 +34,17 @@ doc = false
 [[bin]]
 name = "fuzz_archive_unpack"
 path = "fuzz_targets/fuzz_archive_unpack.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_manifest_index"
+path = "fuzz_targets/fuzz_manifest_index.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_api_filters"
+path = "fuzz_targets/fuzz_api_filters.rs"
 test = false
 doc = false

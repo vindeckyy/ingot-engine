@@ -686,6 +686,7 @@ dependencies = [
 name = "ingot-fuzz"
 version = "0.0.0"
 dependencies = [
+ "ingot-api",
  "ingot-builder",
  "ingot-image",
  "ingot-registry",

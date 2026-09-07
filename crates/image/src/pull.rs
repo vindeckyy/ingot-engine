@@ -2,7 +2,7 @@
 //! image record + tags. Emits docker-format progress messages.
 
 use crate::store::{HistoryEntry, ImageRecord, ImageStore};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use ingot_api::{ContainerConfig, ProgressMessage};
 use ingot_registry::{ImageRef, RegistryClient};
 use std::collections::HashMap;
@@ -39,27 +39,32 @@ pub async fn pull(
             e
         })?;
 
-    // ---- config blob ----
+    // ---- config blob (concurrent with layers) ----
     let config_digest = manifest.config_digest.clone();
-    let _ = client
-        .fetch_blob_to_file(
-            &image,
-            &config_digest,
-            &store.blob_path(&config_digest),
-            auth.as_ref(),
-            &manifest.endpoint,
-        )
-        .await?;
-    let config_bytes = tokio::fs::read(store.blob_path(&config_digest)).await?;
-    let oci_config: OciImageConfig =
-        serde_json::from_slice(&config_bytes).map_err(|e| anyhow!("parse image config: {e}"))?;
+    let cfg_client = Arc::clone(&client);
+    let cfg_image = image.clone();
+    let cfg_auth = auth.clone();
+    let cfg_store = Arc::clone(&store);
+    let cfg_endpoint = manifest.endpoint.clone();
+    let cfg_digest = config_digest.clone();
+    let cfg_task = tokio::spawn(async move {
+        cfg_client
+            .fetch_blob_to_file(
+                &cfg_image,
+                &cfg_digest,
+                &cfg_store.blob_path(&cfg_digest),
+                cfg_auth.as_ref(),
+                &cfg_endpoint,
+            )
+            .await
+    });
 
-    // ---- layers (bounded parallel download, then ordered unpack) ----
+    // ---- layers (bounded parallel download, then parallel unpack) ----
     let mut blobs = Vec::with_capacity(manifest.layers.len());
     let total: i64 = manifest.layers.iter().map(|l| l.size).sum();
     let mut downloaded: i64 = 0;
 
-    let sem = Arc::new(tokio::sync::Semaphore::new(3));
+    let sem = Arc::new(tokio::sync::Semaphore::new(6));
     let blob_endpoint = manifest.endpoint.clone();
     let mut tasks = Vec::with_capacity(manifest.layers.len());
     for (idx, layer) in manifest.layers.iter().enumerate() {
@@ -130,20 +135,39 @@ pub async fn pull(
     for t in tasks {
         results.push(t.await??);
     }
+    // Config downloaded concurrently with layers.
+    cfg_task.await??;
+    let config_bytes = tokio::fs::read(store.blob_path(&config_digest)).await?;
+    let oci_config: OciImageConfig =
+        serde_json::from_slice(&config_bytes).map_err(|e| anyhow!("parse image config: {e}"))?;
     results.sort_by_key(|(idx, _, _, _)| *idx);
     for (_, digest, media, n) in results {
         downloaded += n;
         blobs.push((digest, media));
     }
 
-    // ---- unpack in order ----
-    let mut diff_ids = Vec::with_capacity(blobs.len());
-    for (i, (digest, media)) in blobs.iter().enumerate() {
-        let diff = store
-            .ensure_layer_unpacked(digest, media)
-            .await
-            .with_context(|| format!("unpack layer {i}"))?;
-        diff_ids.push(diff.clone());
+    // ---- unpack in parallel (bounded), results re-ordered ----
+    let mut diff_ids = vec![String::new(); blobs.len()];
+    {
+        let unpack_sem = Arc::new(tokio::sync::Semaphore::new(4));
+        let mut unpack_tasks = Vec::with_capacity(blobs.len());
+        for (i, (digest, media)) in blobs.iter().enumerate() {
+            let permit = Arc::clone(&unpack_sem);
+            let store = Arc::clone(&store);
+            let digest = digest.clone();
+            let media = media.clone();
+            unpack_tasks.push(tokio::spawn(async move {
+                let _p = permit.acquire_owned().await;
+                let d = store.ensure_layer_unpacked(&digest, &media).await?;
+                Ok::<(usize, String), anyhow::Error>((i, d))
+            }));
+        }
+        for t in unpack_tasks {
+            let (i, d) = t.await??;
+            diff_ids[i] = d;
+        }
+    }
+    for (i, digest) in blobs.iter().map(|(d, _)| d).enumerate() {
         send(
             &tx,
             ProgressMessage {

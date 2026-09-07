@@ -6,7 +6,7 @@ use ingot_api::ContainerConfig;
 use ingot_store::paths::DataPaths;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// One image as stored in images/<id>.json.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -56,6 +56,9 @@ pub struct HistoryEntry {
 pub struct ImageStore {
     paths: DataPaths,
     tags: tokio::sync::Mutex<HashMap<String, String>>, // repo:tag → image id
+    /// list() cache (1s TTL): GET /images/json, /system/df, resolve all
+    /// scanned images/*.json per call. Invalidated on mutating paths.
+    list_cache: tokio::sync::RwLock<(std::time::Instant, Vec<ImageRecord>)>,
 }
 
 impl ImageStore {
@@ -67,7 +70,17 @@ impl ImageStore {
         Ok(ImageStore {
             paths,
             tags: tokio::sync::Mutex::new(tags),
+            list_cache: tokio::sync::RwLock::new((
+                std::time::Instant::now() - std::time::Duration::from_secs(10),
+                Vec::new(),
+            )),
         })
+    }
+
+    async fn invalidate_list(&self) {
+        let mut guard = self.list_cache.write().await;
+        guard.0 = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        guard.1.clear();
     }
 
     pub fn blob_path(&self, digest: &str) -> PathBuf {
@@ -120,7 +133,9 @@ impl ImageStore {
             tags.insert(tag.clone(), record.id.clone());
         }
         drop(tags);
-        self.save_tags().await
+        self.save_tags().await?;
+        self.invalidate_list().await;
+        Ok(())
     }
 
     /// Merge a freshly-built record with the stored one under the same id:
@@ -254,7 +269,8 @@ impl ImageStore {
     }
 
     /// Unpack a layer blob into layers/<diffid>/ if not already there.
-    /// Returns the diffID.
+    /// Returns the diffID. Single-pass for cold layers (one decompress),
+    /// zero-decompress for warm layers via a by-blob sidecar cache.
     pub async fn ensure_layer_unpacked(
         &self,
         blob_digest: &str,
@@ -264,22 +280,71 @@ impl ImageStore {
         let blob_path = self.paths.blob(blob_digest);
         let layers_dir = self.paths.layers();
         let media = media_type.to_string();
+        let blob_hex = blob_digest.trim_start_matches("sha256:").to_string();
         tokio::task::spawn_blocking(move || {
-            // Two-pass: hash first (fast) to find the diffID dir; if it
-            // exists we're done.
-            let diff_id = hash_uncompressed(&blob_path, &media)?;
-            let dest = {
-                let hex = diff_id.trim_start_matches("sha256:");
-                layers_dir.join(hex)
-            };
-            if dest.join(".ingot-unpacked").exists() {
-                return Ok(diff_id);
+            let sidecar = layers_dir.join(".by-blob").join(&blob_hex);
+            // Fast path: sidecar hit + dest present = no decompress at all.
+            if let Ok(cached) = std::fs::read_to_string(&sidecar) {
+                let cached = cached.trim().to_string();
+                if cached.starts_with("sha256:") {
+                    let dest = layers_dir.join(cached.trim_start_matches("sha256:"));
+                    if dest.join(".ingot-unpacked").exists() {
+                        return Ok(cached);
+                    }
+                    // Dest missing but diff known: single unpack + verify.
+                    let actual = unpack_layer(&blob_path, &dest, &media)?;
+                    if actual != cached {
+                        anyhow::bail!("diffID mismatch: expected {cached}, unpacked {actual}");
+                    }
+                    let _ = std::fs::write(dest.join(".ingot-unpacked"), "ok");
+                    return Ok(actual);
+                }
             }
-            let actual = unpack_layer(&blob_path, &dest, &media)?;
-            if actual != diff_id {
-                anyhow::bail!("diffID mismatch: expected {diff_id}, unpacked {actual}");
+            // Cold path: single unpack computes diffID; no pre-hash probe
+            // (halves decompress+hash CPU vs the old two-pass).
+            // Probe dest via sidecar miss: unpack to temp then place.
+            // unpack_layer stages + renames internally and returns diffID.
+            // If dest already exists (legacy blob without sidecar), it
+            // still unpacks once but populates the sidecar for next time.
+            let tmp_dest_probe = layers_dir.join(format!(".probe-{blob_hex}"));
+            let _ = tmp_dest_probe;
+            // We don't know diff yet; unpack into a staging area keyed by
+            // blob, then rename to the diff dir.
+            let staging_parent = layers_dir.clone();
+            let _ = staging_parent;
+            // Direct single-pass: unpack_layer needs a dest; use a temp dir
+            // keyed by blob, then rename to final diff dir.
+            let tmp_dir = layers_dir.join(format!(".tmp-unpack-{blob_hex}"));
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            // Unpack to tmp, get diff, then rename to final.
+            // To reuse unpack_layer's staging logic, unpack to a placeholder
+            // then move: simplest is to unpack to final via a two-step where
+            // we first unpack to tmp_dir as if it were the dest, capturing
+            // diff, then rename.
+            // Actually unpack_layer(blob, dest) already stages internally;
+            // we can call it with a provisional dest and rename after.
+            // Use tmp_dir as provisional dest.
+            let diff_id = unpack_layer(&blob_path, &tmp_dir, &media)?;
+            let final_dest = layers_dir.join(diff_id.trim_start_matches("sha256:"));
+            if final_dest.join(".ingot-unpacked").exists() {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+            } else {
+                let _ = std::fs::create_dir_all(layers_dir.join(".by-blob"));
+                // Move tmp unpack into place (rename, fallback copy).
+                if std::fs::rename(&tmp_dir, &final_dest).is_err() {
+                    // Lost race or cross-device: if final now exists we're done.
+                    if !final_dest.join(".ingot-unpacked").exists() {
+                        anyhow::bail!("failed to place unpacked layer {}", final_dest.display());
+                    }
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                } else {
+                    let _ = std::fs::write(final_dest.join(".ingot-unpacked"), "ok");
+                }
             }
-            std::fs::write(dest.join(".ingot-unpacked"), "ok")?;
+            if let Some(parent) = sidecar.parent() {
+                let _ = std::fs::create_dir_all(parent);
+                let _ = std::fs::write(&sidecar, &diff_id);
+            }
             Ok(diff_id)
         })
         .await?
@@ -328,6 +393,7 @@ impl ImageStore {
                     ingot_store::write_json_atomic(&self.paths.image_record(&r.id), &r)?;
                     self.save_tags().await?;
                 }
+                self.invalidate_list().await;
                 Ok(r)
             }
             // Remove every tag + record + blobs that nothing else references.
@@ -341,6 +407,7 @@ impl ImageStore {
                     }
                 }
                 self.delete_record(&record).await?;
+                self.invalidate_list().await;
                 Ok(record)
             }
         }
@@ -349,8 +416,8 @@ impl ImageStore {
     async fn delete_record(&self, record: &ImageRecord) -> Result<()> {
         self.save_tags().await?;
         let _ = tokio::fs::remove_file(self.paths.image_record(&record.id)).await;
-        // Remove layer dirs not used by any remaining image.
-        let remaining = self.list().await?;
+        // Fresh scan for GC correctness (bypass 1s list cache).
+        let remaining = self.list_uncached().await?;
         let used: std::collections::HashSet<String> = remaining
             .iter()
             .flat_map(|r| r.diff_ids.iter().cloned())
@@ -368,6 +435,7 @@ impl ImageStore {
             }
         }
         let _ = tokio::fs::remove_file(self.paths.blob(&record.id)).await; // config blob
+        self.invalidate_list().await;
         Ok(())
     }
 
@@ -380,7 +448,7 @@ impl ImageStore {
     /// skip this while containers use the image: a mounted overlay still
     /// reads the old lowerdirs.
     pub async fn gc_replaced_layers(&self, old: &ImageRecord) -> Result<()> {
-        let remaining = self.list().await?;
+        let remaining = self.list_uncached().await?;
         let used_layers: std::collections::HashSet<&str> = remaining
             .iter()
             .flat_map(|r| r.diff_ids.iter().map(String::as_str))
@@ -401,6 +469,18 @@ impl ImageStore {
     }
 
     pub async fn list(&self) -> Result<Vec<ImageRecord>> {
+        {
+            let guard = self.list_cache.read().await;
+            if guard.0.elapsed() < std::time::Duration::from_secs(1) {
+                return Ok(guard.1.clone());
+            }
+        }
+        let out = self.list_uncached().await?;
+        *self.list_cache.write().await = (std::time::Instant::now(), out.clone());
+        Ok(out)
+    }
+
+    async fn list_uncached(&self) -> Result<Vec<ImageRecord>> {
         let mut out = Vec::new();
         let mut dir = match tokio::fs::read_dir(self.paths.images()).await {
             Ok(d) => d,
@@ -419,30 +499,6 @@ impl ImageStore {
         }
         Ok(out)
     }
-}
-
-/// Hash the uncompressed tar without unpacking (fast diffID probe).
-fn hash_uncompressed(blob_path: &Path, media_type: &str) -> Result<String> {
-    use sha2::Digest;
-    let file = std::fs::File::open(blob_path)?;
-    let mut hasher = sha2::Sha256::new();
-    let mut reader: Box<dyn std::io::Read> =
-        if media_type.ends_with("+gzip") || media_type.contains("gzip") {
-            Box::new(flate2::read::GzDecoder::new(file))
-        } else if media_type.ends_with("+zstd") || media_type.contains("zstd") {
-            Box::new(zstd::Decoder::new(file)?)
-        } else {
-            Box::new(file)
-        };
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 impl ImageRecord {

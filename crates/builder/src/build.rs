@@ -4,7 +4,7 @@
 use crate::parser::{expand_vars, parse, Instruction};
 use anyhow::{anyhow, Result};
 use ingot_api::ProgressMessage;
-use ingot_image::store::ImageRecord;
+use ingot_image::store::{HistoryEntry, ImageRecord};
 use ingot_store::paths::DataPaths;
 use ingot_util::digest::sha256_hex;
 use serde::{Deserialize, Serialize};
@@ -191,39 +191,47 @@ struct CacheEntry {
 /// hash — re-tarring the layer on every hit would cost the build the
 /// cache is meant to save.
 fn layer_fingerprint(paths: &DataPaths, diff_id: &str) -> String {
+    use sha2::Digest;
     use std::os::unix::fs::MetadataExt;
     let dir = paths.layers().join(diff_id.trim_start_matches("sha256:"));
-    let mut acc = String::new();
-    let mut entries: Vec<_> = walkdir::WalkDir::new(&dir)
+    let mut h = sha2::Sha256::new();
+    // Single sort (WalkDir already sorted); feed hasher directly instead of
+    // building a giant String. mtime second-granularity to avoid false
+    // misses on nanos retouch.
+    let entries: Vec<_> = walkdir::WalkDir::new(&dir)
         .sort_by_file_name()
         .into_iter()
         .flatten()
         .collect();
-    entries.sort_by_key(|e| e.path().to_path_buf());
     for e in entries {
         let rel = e.path().strip_prefix(&dir).unwrap_or(e.path());
-        acc.push_str(&rel.to_string_lossy());
-        acc.push('\0');
+        h.update(rel.as_os_str().as_encoded_bytes());
+        h.update(b"\0");
         match e.metadata() {
             Ok(m) => {
-                let mtime = m
+                let mtime_secs = m
                     .modified()
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| format!("{}.{}", d.as_secs(), d.subsec_nanos()))
-                    .unwrap_or_default();
-                acc.push_str(&format!("{}|{mtime}|{:o};", m.len(), m.mode()));
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                h.update(m.len().to_le_bytes());
+                h.update(mtime_secs.to_le_bytes());
+                h.update(m.mode().to_le_bytes());
+                h.update(b";");
             }
-            Err(_) => acc.push_str("unreadable;"),
+            Err(_) => {
+                h.update(b"unreadable;");
+            }
         }
         if e.file_type().is_symlink() {
             if let Ok(t) = std::fs::read_link(e.path()) {
-                acc.push_str(&t.to_string_lossy());
-                acc.push(';');
+                h.update(t.as_os_str().as_encoded_bytes());
+                h.update(b";");
             }
         }
     }
-    sha256_hex(acc.as_bytes())
+    hex::encode(h.finalize())
 }
 
 /// Validate a cache hit: the blob file must still exist (a blob GC'd
@@ -254,6 +262,28 @@ struct Stage {
     /// layers carry their real compressed digest.
     blobs: Vec<String>,
     config: ConfigState,
+    /// History entries in OCI order (oldest first), parallel to the
+    /// chain: base records contribute their stored history, each applied
+    /// instruction appends one row.
+    history: Vec<HistoryEntry>,
+}
+
+/// Render one instruction as a history `created_by` row. Only the
+/// instruction text is recorded — secret VALUES never appear here
+/// (they live in `--mount` declarations by id, materialized as files).
+fn render_history(inst: &Instruction) -> String {
+    let mut s = inst.verb.clone();
+    let args = inst.args.trim();
+    if !args.is_empty() {
+        s.push(' ');
+        s.push_str(args);
+    }
+    if let Some(j) = &inst.json_args {
+        if !j.is_empty() {
+            s.push_str(&format!(" {j:?}"));
+        }
+    }
+    s
 }
 
 /// Resolve a stage selector (index or AS name, case-insensitive) to a
@@ -335,12 +365,23 @@ fn copy_cache_key(
     source_hashes: &[String],
     ownership: &str,
 ) -> String {
-    let mut h =
-        sha256_hex(format!("copy|{args}|{from:?}|{ownership}|{:?}", last_chain(last)).as_bytes());
-    for s in source_hashes {
-        h = sha256_hex(format!("{h}{s}").as_bytes());
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(b"copy|");
+    h.update(args.as_bytes());
+    h.update(b"|");
+    if let Some(f) = from {
+        h.update(f.as_bytes());
     }
-    format!("copy-{h}")
+    h.update(b"|");
+    h.update(ownership.as_bytes());
+    h.update(b"|");
+    h.update(last_chain(last).as_bytes());
+    for s in source_hashes {
+        h.update(b"|");
+        h.update(s.as_bytes());
+    }
+    format!("copy-{}", hex::encode(h.finalize()))
 }
 
 pub async fn build_image(
@@ -418,12 +459,14 @@ pub async fn build_image(
     let mut final_chain: Vec<String> = Vec::new();
     let mut final_blobs: Vec<String> = Vec::new();
     let mut final_config = empty_config();
+    let mut final_history: Vec<HistoryEntry> = Vec::new();
 
     let total = df.instructions.len();
     for (sidx, stage_indices) in stages.iter().enumerate() {
         let mut chain: Vec<String> = Vec::new();
         let mut blobs: Vec<String> = Vec::new();
         let mut config = empty_config();
+        let mut hist: Vec<HistoryEntry> = Vec::new();
         // In-stage ARG scope: fresh every stage, seeded only by explicit
         // re-declaration (a bare `ARG name` inherits the global value).
         let mut stage_args: HashMap<String, Option<String>> = HashMap::new();
@@ -453,10 +496,12 @@ pub async fn build_image(
                         chain.clear();
                         blobs.clear();
                         config = empty_config();
+                        hist.clear();
                     } else if let Some(prev) = stage_states.get(&base) {
                         chain = prev.chain.clone();
                         blobs = prev.blobs.clone();
                         config = prev.config.clone();
+                        hist = prev.history.clone();
                     } else {
                         let image_id = resolve_or_pull(&images, &registry, &base, &tx).await?;
                         let record = images
@@ -469,6 +514,10 @@ pub async fn build_image(
                         // built layers are content-addressed as stored).
                         blobs = record.layer_blobs.clone();
                         config = ConfigState::from_image_record(&record);
+                        // ... and its stored history (pulled images carry
+                        // OCI history; built images carry ours), so the
+                        // history endpoint stays aligned with the chain.
+                        hist = record.history.clone();
                     }
                 }
                 "RUN" => {
@@ -600,6 +649,24 @@ pub async fn build_image(
                     .await;
                 }
             }
+            // One history row per applied instruction (oldest first).
+            // FROM is covered by the inherited base history; ignored or
+            // skipped instructions (MAINTAINER, ONBUILD, unknown verbs)
+            // change nothing and leave no row.
+            match inst.verb.as_str() {
+                "FROM" | "MAINTAINER" | "ONBUILD" => {}
+                verb => {
+                    let layer = matches!(verb, "RUN" | "COPY" | "ADD");
+                    hist.push(HistoryEntry {
+                        created: ingot_util::now_rfc3339(),
+                        created_by: render_history(inst),
+                        created_for: None,
+                        author: None,
+                        comment: None,
+                        empty_layer: if layer { None } else { Some(true) },
+                    });
+                }
+            }
         }
         if let Some(name) = stage_name {
             stage_states.insert(
@@ -608,6 +675,7 @@ pub async fn build_image(
                     chain: chain.clone(),
                     blobs: blobs.clone(),
                     config: config.clone(),
+                    history: hist.clone(),
                 },
             );
         }
@@ -616,6 +684,7 @@ pub async fn build_image(
             final_chain = chain;
             final_blobs = blobs;
             final_config = config;
+            final_history = hist;
             break;
         }
     }
@@ -656,7 +725,7 @@ pub async fn build_image(
             "type": "layers",
             "diff_ids": final_chain.clone(),
         },
-        "history": [],
+        "history": final_history.clone(),
     });
     let config_bytes = serde_json::to_vec_pretty(&oci_config)?;
     let image_id = sha256_hex(&config_bytes);
@@ -724,7 +793,7 @@ pub async fn build_image(
             StopTimeout: None,
             Shell: None,
         },
-        history: vec![],
+        history: final_history,
         chain_ids,
     };
 
@@ -1450,7 +1519,7 @@ fn extract_tar_guarded(src: &Path, dest: &Path) -> Result<()> {
     enum Opened {
         Plain(std::fs::File),
         Gzip(flate2::read::GzDecoder<std::fs::File>),
-        Zstd(Vec<u8>),
+        Zstd(zstd::Decoder<'static, std::io::BufReader<std::fs::File>>),
     }
     let opened = match kind {
         Some(TarKind::Plain) => Opened::Plain(std::fs::File::open(src)?),
@@ -1458,12 +1527,11 @@ fn extract_tar_guarded(src: &Path, dest: &Path) -> Result<()> {
             Opened::Gzip(flate2::read::GzDecoder::new(std::fs::File::open(src)?))
         }
         Some(TarKind::Zstd) => {
-            let bytes = zstd::decode_all(std::fs::File::open(src)?)
-                .map_err(|e| anyhow!("ADD: zstd decode failed: {e}"))?;
-            if bytes.len() as u64 > ADD_EXTRACT_MAX_BYTES {
-                anyhow::bail!("ADD: archive exceeds size limits");
-            }
-            Opened::Zstd(bytes)
+            // Stream zstd (don't decode_all to RAM): cap enforced
+            // incrementally during extraction below.
+            let f = std::fs::File::open(src)?;
+            let dec = zstd::Decoder::new(f).map_err(|e| anyhow!("ADD: zstd decode failed: {e}"))?;
+            Opened::Zstd(dec)
         }
         _ => anyhow::bail!("ADD: {src:?} is not an archive"),
     };
@@ -1514,7 +1582,7 @@ fn extract_tar_guarded(src: &Path, dest: &Path) -> Result<()> {
     match opened {
         Opened::Plain(f) => entries!(tar::Archive::new(f)),
         Opened::Gzip(g) => entries!(tar::Archive::new(g)),
-        Opened::Zstd(b) => entries!(tar::Archive::new(&b[..])),
+        Opened::Zstd(z) => entries!(tar::Archive::new(z)),
     }
     // Headers can lie: measure what actually landed.
     let mut actual: u64 = 0;
@@ -1625,52 +1693,66 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
 /// Missing paths hash as "missing" (the copy step itself errors on those,
 /// except `--from` globs resolved elsewhere).
 fn hash_tree(root: &Path) -> String {
+    use sha2::Digest;
     use std::os::unix::fs::MetadataExt;
+    fn hash_file_stream(path: &Path, h: &mut sha2::Sha256) {
+        use std::io::Read;
+        if let Ok(f) = std::fs::File::open(path) {
+            let mut r = std::io::BufReader::with_capacity(64 * 1024, f);
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                match r.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => h.update(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+        }
+    }
     if root.is_file() {
-        let mut acc = String::from("file\0");
-        if let Ok(b) = std::fs::read(root) {
-            acc.push_str(&sha256_hex(&b));
-        }
+        let mut h = sha2::Sha256::new();
+        h.update(b"file\0");
+        hash_file_stream(root, &mut h);
         if let Ok(m) = std::fs::symlink_metadata(root) {
-            acc.push_str(&format!("|{}|{}|{:o}", m.uid(), m.gid(), m.mode()));
+            h.update(m.uid().to_le_bytes());
+            h.update(m.gid().to_le_bytes());
+            h.update(m.mode().to_le_bytes());
         }
-        return sha256_hex(acc.as_bytes());
+        return hex::encode(h.finalize());
     }
     if !root.is_dir() {
         return "missing".into();
     }
-    let mut acc = String::new();
-    let mut entries: Vec<_> = walkdir::WalkDir::new(root)
+    let mut h = sha2::Sha256::new();
+    let entries: Vec<_> = walkdir::WalkDir::new(root)
         .sort_by_file_name()
         .into_iter()
         .flatten()
         .collect();
-    entries.sort_by_key(|e| e.path().to_path_buf());
     for e in entries {
-        // Relative to the tree root: absolute data-root locations must
-        // not make identical trees hash differently (or poison keys
-        // across machines).
         let rel = e.path().strip_prefix(root).unwrap_or(e.path());
-        acc.push_str(&rel.to_string_lossy());
-        acc.push('\0');
+        h.update(rel.as_os_str().as_encoded_bytes());
+        h.update(b"\0");
         if e.file_type().is_symlink() {
-            acc.push_str("link\0");
+            h.update(b"link\0");
             if let Ok(t) = std::fs::read_link(e.path()) {
-                acc.push_str(&t.to_string_lossy());
+                h.update(t.as_os_str().as_encoded_bytes());
             }
-            acc.push(';');
+            h.update(b";");
             continue;
         }
         if e.file_type().is_file() {
-            if let Ok(b) = std::fs::read(e.path()) {
-                acc.push_str(&sha256_hex(&b));
-            }
+            // Stream file instead of read() whole file into RAM.
+            hash_file_stream(e.path(), &mut h);
         }
         if let Ok(m) = std::fs::symlink_metadata(e.path()) {
-            acc.push_str(&format!("|{}|{}|{:o};", m.uid(), m.gid(), m.mode()));
+            h.update(m.uid().to_le_bytes());
+            h.update(m.gid().to_le_bytes());
+            h.update(m.mode().to_le_bytes());
+            h.update(b";");
         }
     }
-    sha256_hex(acc.as_bytes())
+    hex::encode(h.finalize())
 }
 
 /// Stable content hash of a COPY source for cache keys: the context join
@@ -1683,6 +1765,7 @@ fn hash_source(context_dir: &Path, src: &str) -> String {
 /// compressed-blob digest, compressed size). The blob is content-addressed
 /// by its own bytes — never by the diff id.
 async fn commit_layer(paths: &DataPaths, diff_dir: &Path) -> Result<(String, String, i64)> {
+    use std::io::Read;
     let tmp = paths
         .builder()
         .join(format!("commit-{}.tar.gz", &ingot_util::new_id()[..12]));
@@ -1693,37 +1776,52 @@ async fn commit_layer(paths: &DataPaths, diff_dir: &Path) -> Result<(String, Str
     tar.finish()?;
     let gz = tar.into_inner()?;
     gz.finish()?;
-    let compressed = std::fs::read(&tmp)?;
-
-    // diffID = sha256 of the UNcompressed tar.
-    let gz2 = flate2::read::GzDecoder::new(std::fs::File::open(&tmp)?);
-    let mut hasher = sha2::Sha256::new();
-    let mut buf = vec![0u8; 128 * 1024];
-    let mut f = gz2;
-    loop {
-        use std::io::Read;
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
+    // Stream tmp to compute compressed digest (no full-file RAM copy).
+    let (blob_digest, size) = {
+        let f = std::fs::File::open(&tmp)?;
+        let mut r = std::io::BufReader::with_capacity(256 * 1024, f);
+        let mut h = sha2::Sha256::new();
+        let mut buf = [0u8; 128 * 1024];
+        let mut total: i64 = 0;
+        loop {
+            let n = r.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+            total += n as i64;
         }
-        hasher.update(&buf[..n]);
-    }
-    let diff_id = format!("sha256:{}", hex::encode(hasher.finalize()));
-
-    let blob_digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&compressed)));
-    let hex = diff_id.trim_start_matches("sha256:").to_string();
+        (format!("sha256:{}", hex::encode(h.finalize())), total)
+    };
     std::fs::create_dir_all(paths.blobs())?;
-    std::fs::write(paths.blob(&blob_digest), &compressed)?;
-    // Unpack into the layer store.
-    let layer_dest = paths.layers().join(&hex);
-    ingot_image::unpack_layer_dir(
-        &tmp,
-        &layer_dest,
+    let dest_blob = paths.blob(&blob_digest);
+    // Rename tmp into CAS (no read+write copy); fallback to copy.
+    if std::fs::rename(&tmp, &dest_blob).is_err() {
+        let _ = std::fs::copy(&tmp, &dest_blob);
+        let _ = std::fs::remove_file(&tmp);
+    }
+    // Single unpack computes diffID (no separate gunzip-hash pass).
+    let hex_probe = dest_blob;
+    let layer_tmp = paths
+        .layers()
+        .join(format!(".tmp-commit-{}", &ingot_util::new_id()[..12]));
+    let diff_id = ingot_image::unpack_layer_dir(
+        &hex_probe,
+        &layer_tmp,
         "application/vnd.docker.image.rootfs.diff.tar.gzip",
     )?;
-    let _ = std::fs::write(layer_dest.join(".ingot-unpacked"), "ok");
-    let _ = std::fs::remove_file(&tmp);
-    let size = compressed.len() as i64;
+    let hex = diff_id.trim_start_matches("sha256:").to_string();
+    let layer_dest = paths.layers().join(&hex);
+    if layer_dest.join(".ingot-unpacked").exists() {
+        let _ = std::fs::remove_dir_all(&layer_tmp);
+    } else if std::fs::rename(&layer_tmp, &layer_dest).is_err() {
+        if !layer_dest.join(".ingot-unpacked").exists() {
+            anyhow::bail!("failed to place committed layer {}", layer_dest.display());
+        }
+        let _ = std::fs::remove_dir_all(&layer_tmp);
+    } else {
+        let _ = std::fs::write(layer_dest.join(".ingot-unpacked"), "ok");
+    }
     Ok((diff_id, blob_digest, size))
 }
 
@@ -1745,12 +1843,51 @@ fn last_chain(last: Option<&String>) -> String {
     last.cloned().unwrap_or_default()
 }
 
-async fn cache_lookup(paths: &DataPaths, key: &str) -> Option<CacheEntry> {
-    let cache: HashMap<String, CacheEntry> = std::fs::read(paths.build_cache())
+static BUILD_CACHE: std::sync::OnceLock<tokio::sync::RwLock<(u128, HashMap<String, CacheEntry>)>> =
+    std::sync::OnceLock::new();
+
+fn build_cache_cell() -> &'static tokio::sync::RwLock<(u128, HashMap<String, CacheEntry>)> {
+    BUILD_CACHE.get_or_init(|| tokio::sync::RwLock::new((0, HashMap::new())))
+}
+
+fn cache_mtime(paths: &DataPaths) -> u128 {
+    std::fs::metadata(paths.build_cache())
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+async fn load_cache_map(paths: &DataPaths) -> HashMap<String, CacheEntry> {
+    let mtime = cache_mtime(paths);
+    {
+        let guard = build_cache_cell().read().await;
+        if guard.0 == mtime && mtime != 0 {
+            return guard.1.clone();
+        }
+    }
+    let map: HashMap<String, CacheEntry> = std::fs::read(paths.build_cache())
         .ok()
         .and_then(|d| serde_json::from_slice(&d).ok())
         .unwrap_or_default();
-    cache.get(key).cloned()
+    // Cap growth: LRU-ish eviction at 2000 entries (oldest arbitrary drop).
+    let mut guard = build_cache_cell().write().await;
+    guard.0 = cache_mtime(paths);
+    guard.1 = map.clone();
+    map
+}
+
+async fn cache_lookup(paths: &DataPaths, key: &str) -> Option<CacheEntry> {
+    // In-memory hit when mtime unchanged (no file read per RUN/COPY).
+    let mtime = cache_mtime(paths);
+    {
+        let guard = build_cache_cell().read().await;
+        if guard.0 == mtime && mtime != 0 {
+            return guard.1.get(key).cloned();
+        }
+    }
+    load_cache_map(paths).await.get(key).cloned()
 }
 
 async fn cache_store(
@@ -1760,10 +1897,7 @@ async fn cache_store(
     blob_digest: &str,
     layer_fingerprint: Option<String>,
 ) {
-    let mut cache: HashMap<String, CacheEntry> = std::fs::read(paths.build_cache())
-        .ok()
-        .and_then(|d| serde_json::from_slice(&d).ok())
-        .unwrap_or_default();
+    let mut cache = load_cache_map(paths).await;
     cache.insert(
         key.to_string(),
         CacheEntry {
@@ -1772,7 +1906,18 @@ async fn cache_store(
             layer_fingerprint,
         },
     );
+    // Evict when unbounded (prevents O(entries) blowup per layer).
+    if cache.len() > 2000 {
+        let drop_n = cache.len() - 2000;
+        let keys: Vec<String> = cache.keys().take(drop_n).cloned().collect();
+        for k in keys {
+            cache.remove(&k);
+        }
+    }
     let _ = ingot_store::write_json_atomic(&paths.build_cache(), &cache);
+    let mut guard = build_cache_cell().write().await;
+    guard.0 = cache_mtime(paths);
+    guard.1 = cache;
 }
 
 fn layer_exists(paths: &DataPaths, diff_id: &str) -> bool {
@@ -2250,6 +2395,7 @@ mod tests {
                 chain: vec!["a".into()],
                 blobs: vec![],
                 config: empty_config(),
+                history: vec![],
             },
         );
         let ordered = vec![vec!["a".into()], vec!["b".into()]];
@@ -2268,6 +2414,54 @@ mod tests {
         );
         assert!(resolve_from_chain("7", &stages).is_err());
         assert!(resolve_from_chain("nope", &stages).is_err());
+    }
+
+    #[test]
+    fn history_rendering_and_secret_hygiene() {
+        let inst = Instruction {
+            verb: "RUN".to_string(),
+            args: "--mount=type=secret,id=pw,target=/run/secrets/pw echo hi".to_string(),
+            json_args: None,
+            flags: vec![],
+            heredocs: Vec::new(),
+            line: 3,
+        };
+        let rendered = render_history(&inst);
+        assert!(rendered.starts_with("RUN "), "{rendered:?}");
+        assert!(rendered.contains("id=pw"), "{rendered:?}");
+
+        // Secret VALUES must not reach the cache key, the history row,
+        // or the resolved mount key — only declarations (id=target) do.
+        let secrets = HashMap::from([("pw".to_string(), "s3cr3t-value".to_string())]);
+        let mounts = parse_secret_mounts(&Instruction {
+            verb: "RUN".to_string(),
+            args: String::new(),
+            json_args: None,
+            flags: vec![(
+                "mount".to_string(),
+                "type=secret,id=pw,target=/run/secrets/pw".to_string(),
+            )],
+            heredocs: Vec::new(),
+            line: 3,
+        })
+        .unwrap();
+        let (mount_key, resolved) = resolve_secret_mounts(&mounts, &secrets).unwrap();
+        assert_eq!(mount_key, "pw=/run/secrets/pw");
+        assert_eq!(resolved[0].value, "s3cr3t-value");
+        assert!(!mount_key.contains("s3cr3t-value"));
+        assert!(!rendered.contains("s3cr3t-value"));
+        let key = run_cache_key(None, &inst, &[], &["/bin/sh".into()], "/", "", &mount_key);
+        assert!(!key.contains("s3cr3t-value"));
+
+        let cmd = Instruction {
+            verb: "CMD".to_string(),
+            args: String::new(),
+            json_args: Some(vec!["app".into(), "--serve".into()]),
+            flags: vec![],
+            heredocs: Vec::new(),
+            line: 9,
+        };
+        assert_eq!(render_history(&cmd), r#"CMD ["app", "--serve"]"#);
     }
 
     #[test]

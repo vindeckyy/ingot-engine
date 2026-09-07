@@ -3,6 +3,7 @@
 
 pub mod fsck;
 pub mod pull;
+pub mod push;
 pub mod store;
 pub mod unpack;
 

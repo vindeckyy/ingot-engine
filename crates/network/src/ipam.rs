@@ -8,13 +8,19 @@
 use ingot_store::paths::DataPaths;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct IpamLeases {
-    /// network id → allocated ips (u32, host order)
-    pub allocated: HashMap<String, Vec<u32>>,
+    /// network id → allocated ips (u32, host order). HashSet for O(1)
+    /// membership; serializes as a JSON array (back-compat with Vec).
+    pub allocated: HashMap<String, std::collections::HashSet<u32>>,
+    /// network id → allocated IPv6 addresses (u128). Absent in
+    /// pre-dual-stack files: `default` migrates them to "none leased".
+    /// Unknown-field tolerance keeps old binaries reading new files.
+    #[serde(default)]
+    pub allocated_v6: HashMap<String, std::collections::HashSet<u128>>,
 }
 
 /// A parsed IPv4 subnet with its usable host range.
@@ -89,6 +95,82 @@ pub fn default_gateway(subnet: &Subnet) -> Ipv4Addr {
     Ipv4Addr::from(subnet.usable_range().0)
 }
 
+/// A parsed IPv6 subnet (dual-stack ULA range, e.g. fd00:dead:beef:1::/64).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V6Subnet {
+    /// Network address (masked).
+    pub network: u128,
+    /// Prefix length.
+    pub prefix: u8,
+}
+
+impl V6Subnet {
+    /// Parse "a:b::/p". Docker-shaped errors ("invalid ...") so callers
+    /// can map them to HTTP 400. Host bits are masked off like Docker.
+    pub fn parse(cidr: &str) -> anyhow::Result<V6Subnet> {
+        let (addr, prefix) = cidr
+            .split_once('/')
+            .ok_or_else(|| anyhow::anyhow!("invalid subnet {cidr:?} (want a:b::/p)"))?;
+        let ip: u128 = addr
+            .parse::<Ipv6Addr>()
+            .map_err(|_| anyhow::anyhow!("invalid subnet address in {cidr:?} (want IPv6)"))?
+            .into();
+        // Reject IPv4-mapped input explicitly: "1.2.3.0/24" parses as an
+        // IPv6 address (::ffff:1.2.3.0) but is never a valid v6 subnet.
+        if addr.contains('.') {
+            anyhow::bail!("invalid subnet address in {cidr:?} (want IPv6)");
+        }
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid subnet prefix in {cidr:?}"))?;
+        if prefix > 126 {
+            anyhow::bail!("invalid subnet {cidr:?} (prefix must leave host addresses)");
+        }
+        let mask = if prefix == 0 {
+            0u128
+        } else {
+            u128::MAX << (128 - prefix)
+        };
+        Ok(V6Subnet {
+            network: ip & mask,
+            prefix,
+        })
+    }
+
+    /// First and last usable host addresses (inclusive). Mirrors the v4
+    /// shape (network and last address excluded); v6 has no broadcast,
+    /// but the last address stays reserved all the same.
+    pub fn usable_range(&self) -> (u128, u128) {
+        let mask = if self.prefix == 0 {
+            0u128
+        } else {
+            u128::MAX << (128 - self.prefix)
+        };
+        let last = self.network | !mask;
+        (self.network + 1, last - 1)
+    }
+
+    pub fn contains(&self, ip: u128) -> bool {
+        let (lo, hi) = self.usable_range();
+        (lo..=hi).contains(&ip)
+    }
+
+    pub fn overlaps(&self, other: &V6Subnet) -> bool {
+        let (a_lo, a_hi) = self.usable_range();
+        let (b_lo, b_hi) = other.usable_range();
+        a_lo <= b_hi && b_lo <= a_hi
+    }
+
+    pub fn cidr(&self) -> String {
+        format!("{}/{}", Ipv6Addr::from(self.network), self.prefix)
+    }
+}
+
+/// Default v6 gateway for a subnet: first usable address (the ::1 rule).
+pub fn default_gateway_v6(subnet: &V6Subnet) -> Ipv6Addr {
+    Ipv6Addr::from(subnet.usable_range().0)
+}
+
 pub struct Ipam {
     path: std::path::PathBuf,
     state: tokio::sync::Mutex<IpamLeases>,
@@ -127,7 +209,7 @@ impl Ipam {
         let (lo, hi) = sub.usable_range();
         for c in lo..=hi {
             if c != gw && !used.contains(&c) {
-                used.push(c);
+                used.insert(c);
                 let _ = ingot_store::write_json_atomic(&self.path, &*state);
                 return Ok(Ipv4Addr::from(c));
             }
@@ -167,17 +249,96 @@ impl Ipam {
         if used.contains(&want) {
             anyhow::bail!("requested IP {ip} is already allocated");
         }
-        used.push(want);
+        used.insert(want);
         let _ = ingot_store::write_json_atomic(&self.path, &*state);
         Ok(Ipv4Addr::from(want))
+    }
+
+    /// Allocate the lowest free usable v6 address that is not the gateway.
+    pub async fn allocate_v6(
+        &self,
+        network_id: &str,
+        subnet: &str,
+        gateway: &str,
+    ) -> anyhow::Result<Ipv6Addr> {
+        let sub = V6Subnet::parse(subnet)?;
+        let gw: u128 = gateway
+            .parse::<Ipv6Addr>()
+            .map_err(|e| anyhow::anyhow!("invalid gateway {gateway}: {e}"))?
+            .into();
+        if !sub.contains(gw) {
+            anyhow::bail!("invalid gateway {gateway}: outside subnet {subnet}");
+        }
+        let mut state = self.state.lock().await;
+        let used = state
+            .allocated_v6
+            .entry(network_id.to_string())
+            .or_default();
+        let (lo, hi) = sub.usable_range();
+        let mut c = lo;
+        loop {
+            if c != gw && !used.contains(&c) {
+                used.insert(c);
+                let _ = ingot_store::write_json_atomic(&self.path, &*state);
+                return Ok(Ipv6Addr::from(c));
+            }
+            if c == hi {
+                break;
+            }
+            c += 1;
+        }
+        Err(anyhow::anyhow!(
+            "could not find an available IPv6 address on network {network_id}"
+        ))
+    }
+
+    /// Reserve one requested (static) v6 address. Fails when the address
+    /// is outside the subnet, is the network/gateway/last address, or is
+    /// already leased.
+    pub async fn reserve_v6(
+        &self,
+        network_id: &str,
+        subnet: &str,
+        gateway: &str,
+        ip: &str,
+    ) -> anyhow::Result<Ipv6Addr> {
+        let sub = V6Subnet::parse(subnet)?;
+        let gw: u128 = gateway
+            .parse::<Ipv6Addr>()
+            .map_err(|e| anyhow::anyhow!("invalid gateway {gateway}: {e}"))?
+            .into();
+        let want: u128 = ip
+            .parse::<Ipv6Addr>()
+            .map_err(|e| anyhow::anyhow!("invalid IP address {ip}: {e}"))?
+            .into();
+        if !sub.contains(want) {
+            anyhow::bail!("requested IP {ip} is outside subnet {subnet}");
+        }
+        if want == gw {
+            anyhow::bail!("requested IP {ip} is the gateway address");
+        }
+        let mut state = self.state.lock().await;
+        let used = state
+            .allocated_v6
+            .entry(network_id.to_string())
+            .or_default();
+        if used.contains(&want) {
+            anyhow::bail!("requested IP {ip} is already allocated");
+        }
+        used.insert(want);
+        let _ = ingot_store::write_json_atomic(&self.path, &*state);
+        Ok(Ipv6Addr::from(want))
     }
 
     /// Drop a network's whole lease bucket (network removal: the bridge
     /// and all its endpoints are gone, so no lease can be live).
     pub async fn reset_bucket(&self, network_id: &str) {
         let mut state = self.state.lock().await;
-        state.allocated.remove(network_id);
-        let _ = ingot_store::write_json_atomic(&self.path, &*state);
+        let drop4 = state.allocated.remove(network_id).is_some();
+        let drop6 = state.allocated_v6.remove(network_id).is_some();
+        if drop4 || drop6 {
+            let _ = ingot_store::write_json_batched(&self.path, &*state);
+        }
     }
 
     /// Boot sweep: drop buckets for networks that no longer exist and
@@ -207,7 +368,7 @@ impl Ipam {
             true
         });
         if dropped > 0 || released > 0 {
-            let _ = ingot_store::write_json_atomic(&self.path, &*state);
+            let _ = ingot_store::write_json_batched(&self.path, &*state);
         }
         (dropped, released)
     }
@@ -215,12 +376,62 @@ impl Ipam {
     pub async fn release(&self, network_id: &str, ip: &str) {
         if let Ok(parsed) = ip.parse::<Ipv4Addr>() {
             let mut state = self.state.lock().await;
+            let mut removed = false;
             if let Some(used) = state.allocated.get_mut(network_id) {
                 let v: u32 = parsed.into();
-                used.retain(|x| *x != v);
+                removed = used.remove(&v);
             }
-            let _ = ingot_store::write_json_atomic(&self.path, &*state);
+            // Skip the file rewrite when nothing changed (unknown network
+            // or already-released IP): previously every release rewrote
+            // ipam-leases.json even on miss.
+            if removed {
+                let _ = ingot_store::write_json_batched(&self.path, &*state);
+            }
         }
+    }
+
+    pub async fn release_v6(&self, network_id: &str, ip: &str) {
+        if let Ok(parsed) = ip.parse::<Ipv6Addr>() {
+            let mut state = self.state.lock().await;
+            let mut removed = false;
+            if let Some(used) = state.allocated_v6.get_mut(network_id) {
+                let v: u128 = parsed.into();
+                removed = used.remove(&v);
+            }
+            if removed {
+                let _ = ingot_store::write_json_batched(&self.path, &*state);
+            }
+        }
+    }
+
+    /// Boot sweep for v6 leases, mirroring [`Ipam::sweep_orphans`].
+    /// v6 endpoints are not yet persisted in container records (dynamic
+    /// per boot), so the daemon passes an empty live set until the
+    /// record carries the v6 address — every v6 lease is then garbage
+    /// from a dead daemon. Returns (dropped_buckets, released_ips).
+    pub async fn sweep_orphans_v6(
+        &self,
+        known_net_ids: &std::collections::HashSet<String>,
+        live: &std::collections::HashSet<(String, u128)>,
+    ) -> (usize, usize) {
+        let mut state = self.state.lock().await;
+        let mut dropped = 0usize;
+        let mut released = 0usize;
+        state.allocated_v6.retain(|net_id, ips| {
+            if !known_net_ids.contains(net_id) {
+                dropped += 1;
+                released += ips.len();
+                return false;
+            }
+            let before = ips.len();
+            ips.retain(|ip| live.contains(&(net_id.clone(), *ip)));
+            released += before - ips.len();
+            true
+        });
+        if dropped > 0 || released > 0 {
+            let _ = ingot_store::write_json_batched(&self.path, &*state);
+        }
+        (dropped, released)
     }
 }
 
@@ -299,6 +510,121 @@ mod tests {
             .reserve("m", "192.168.9.0/30", "192.168.9.1", "192.168.9.2")
             .await
             .is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn v6_subnet_parsing_and_range() {
+        let s = V6Subnet::parse("fd00:dead:beef:1::/64").unwrap();
+        assert_eq!(s.prefix, 64);
+        assert_eq!(
+            Ipv6Addr::from(s.usable_range().0).to_string(),
+            "fd00:dead:beef:1::1"
+        );
+        assert_eq!(default_gateway_v6(&s).to_string(), "fd00:dead:beef:1::1");
+        // Host bits are masked like Docker normalizes.
+        assert_eq!(V6Subnet::parse("fd00:dead:beef:1::99/64").unwrap(), s);
+        assert_eq!(s.cidr(), "fd00:dead:beef:1::/64");
+        // Docker-shaped errors for bad v6 input.
+        for bad in [
+            "nope",
+            "10.0.0.0/24",
+            "1.2.3.0/24",
+            "fd00::/127",
+            "fd00::/128",
+            "fd00::/129",
+            "fd00::",
+        ] {
+            let err = V6Subnet::parse(bad).unwrap_err().to_string();
+            assert!(err.starts_with("invalid "), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn v6_overlap_detection() {
+        let a = V6Subnet::parse("fd00:dead:beef::/48").unwrap();
+        assert!(a.overlaps(&V6Subnet::parse("fd00:dead:beef:1::/64").unwrap()));
+        assert!(!a.overlaps(&V6Subnet::parse("fd00:dead:beee::/48").unwrap()));
+        assert!(!V6Subnet::parse("fd00::1:0:0:0/96")
+            .unwrap()
+            .overlaps(&V6Subnet::parse("fd00::2:0:0:0/96").unwrap()));
+    }
+
+    #[test]
+    fn v6_store_schema_migrates_old_files() {
+        // Pre-dual-stack ipam-leases.json has no allocated_v6 key.
+        let leases: IpamLeases = serde_json::from_str(r#"{"allocated":{"n":[12345]}}"#).unwrap();
+        assert!(leases.allocated_v6.is_empty());
+        assert!(leases.allocated.contains_key("n"));
+    }
+
+    #[tokio::test]
+    async fn allocate_v6_skips_gateway_and_exhausts() {
+        let dir = std::env::temp_dir().join(format!("ipam-v6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = DataPaths::new(dir.clone(), dir.clone());
+        let ipam = Ipam::new(&paths);
+        // /126: usable ::1 (gateway) + ::2 only.
+        let first = ipam
+            .allocate_v6("n", "fd00::/126", "fd00::1")
+            .await
+            .unwrap();
+        assert_eq!(first.to_string(), "fd00::2");
+        let err = ipam
+            .allocate_v6("n", "fd00::/126", "fd00::1")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("available IPv6"), "{err}");
+        // Static reservations conflict and validate.
+        assert!(ipam
+            .reserve_v6("m", "fd00::/126", "fd00::1", "fd00::2")
+            .await
+            .is_ok());
+        assert!(ipam
+            .reserve_v6("m", "fd00::/126", "fd00::1", "fd00::2")
+            .await
+            .is_err());
+        assert!(ipam
+            .reserve_v6("m", "fd00::/126", "fd00::1", "fd00::1")
+            .await
+            .is_err());
+        assert!(ipam
+            .reserve_v6("m", "fd00::/126", "fd00::1", "fd01::2")
+            .await
+            .is_err());
+        ipam.release_v6("m", "fd00::2").await;
+        assert!(ipam
+            .reserve_v6("m", "fd00::/126", "fd00::1", "fd00::2")
+            .await
+            .is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sweep_orphans_v6_reclaims_dead_buckets_and_leases() {
+        let dir = std::env::temp_dir().join(format!("ipam-v6sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = DataPaths::new(dir.clone(), dir.clone());
+        let ipam = Ipam::new(&paths);
+        let a = ipam
+            .allocate_v6("n", "fd00::/120", "fd00::1")
+            .await
+            .unwrap();
+        ipam.allocate_v6("n", "fd00::/120", "fd00::1")
+            .await
+            .unwrap();
+        ipam.allocate_v6("gone", "fd01::/120", "fd01::1")
+            .await
+            .unwrap();
+        let known: std::collections::HashSet<String> = ["n".to_string()].into_iter().collect();
+        let au: u128 = a.into();
+        let live: std::collections::HashSet<(String, u128)> =
+            [("n".to_string(), au)].into_iter().collect();
+        let (dropped, released) = ipam.sweep_orphans_v6(&known, &live).await;
+        assert_eq!((dropped, released), (1, 2));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

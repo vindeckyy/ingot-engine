@@ -5,6 +5,7 @@ pub mod client;
 pub mod reference;
 
 pub use client::{
-    daemon_platform, parse_platform, Challenge, Descriptor, PlatformManifest, RegistryClient,
+    daemon_platform, parse_platform, select_index_digest, Challenge, Descriptor, PlatformManifest,
+    RegistryClient,
 };
 pub use reference::ImageRef;
