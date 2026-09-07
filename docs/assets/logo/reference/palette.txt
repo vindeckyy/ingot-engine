@@ -1,0 +1,9 @@
+ingot-engine approximate brand palette
+
+Graphite: #101216
+Charcoal: #202428
+Copper:   #C76316
+Amber:    #E9892F
+White:    #FFFFFF
+
+These are practical approximations for UI/brand use, not a vector-source color spec.
