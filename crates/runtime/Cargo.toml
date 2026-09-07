@@ -21,3 +21,4 @@ ingot-store.workspace = true
 ingot-image.workspace = true
 ingot-network.workspace = true
 walkdir.workspace = true
+seccompiler.workspace = true

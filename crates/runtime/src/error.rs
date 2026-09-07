@@ -39,30 +39,39 @@ impl CreateError {
 }
 
 /// Docker container-name rules: `/` prefix optional, then
-/// `[a-zA-Z0-9_.-]+`.
+/// `[a-zA-Z0-9][a-zA-Z0-9_.-]*`.
 pub fn valid_name(name: &str) -> bool {
-    let bare = name.strip_prefix('/').unwrap_or(name);
-    !bare.is_empty()
-        && bare
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+    ingot_util::validate_container_name(name).is_ok()
 }
 
 /// Validate everything checkable before allocating container state.
 /// Image existence and name-taken races are checked by the caller
 /// (they need the store); pure option validation lives here so it is
 /// unit-testable without root (Tier 1).
-pub fn validate_create(body: &ContainerCreateBody, name: Option<&str>) -> Result<(), CreateError> {
+pub fn validate_create(
+    body: &ContainerCreateBody,
+    name: Option<&str>,
+    platform: Option<&str>,
+) -> Result<(), CreateError> {
+    if let Some(p) = platform {
+        let p_clean = p.trim().to_lowercase();
+        if !p_clean.is_empty() && p_clean != "linux/amd64" && p_clean != "linux" {
+            return Err(CreateError::bad(
+                "platform",
+                format!("unsupported platform {p:?}; only linux/amd64 is supported"),
+            ));
+        }
+    }
     if let Some(n) = name {
         if !valid_name(n) {
             return Err(CreateError::bad(
                 "container name",
-                format!("{n:?} must match /?[a-zA-Z0-9_.-]+"),
+                format!("{n:?} must match /?[a-zA-Z0-9][a-zA-Z0-9_.-]*"),
             ));
         }
     }
-    if body.Image.is_empty() {
-        return Err(CreateError::bad("image", "image name must not be empty"));
+    if body.Image.trim().is_empty() {
+        return Err(CreateError::bad("image", "no command specified"));
     }
     validate_hostconfig(&body.HostConfig)?;
     validate_networking_config(body)?;
@@ -158,6 +167,18 @@ fn validate_config(body: &ContainerCreateBody) -> Result<(), CreateError> {
                 ));
             }
         }
+    }
+    if !body.Domainname.is_empty() {
+        return Err(CreateError::unsupported("Domainname"));
+    }
+    if body.ArgsEscaped {
+        return Err(CreateError::unsupported("ArgsEscaped"));
+    }
+    if body.OnBuild.as_ref().is_some_and(|v| !v.is_empty()) {
+        return Err(CreateError::unsupported("OnBuild"));
+    }
+    if body.Shell.as_ref().is_some_and(|v| !v.is_empty()) {
+        return Err(CreateError::unsupported("Shell"));
     }
     Ok(())
 }
@@ -319,10 +340,17 @@ fn validate_binds(hc: &HostConfig) -> Result<(), CreateError> {
         let parts: Vec<&str> = bind.split(':').collect();
         // Single segment = anonymous volume destination (e.g. `-v /data`).
         if parts.len() == 1 {
-            if !parts[0].starts_with('/') {
+            let dst = parts[0];
+            if !dst.starts_with('/') {
                 return Err(CreateError::bad(
                     "bind",
                     format!("{bind:?} must be an absolute container path or src:dst[:ro|rw]"),
+                ));
+            }
+            if dst.split('/').any(|p| p == "..") {
+                return Err(CreateError::bad(
+                    "bind",
+                    format!("{bind:?} destination contains '..' traversal"),
                 ));
             }
             continue;
@@ -332,6 +360,20 @@ fn validate_binds(hc: &HostConfig) -> Result<(), CreateError> {
                 "bind",
                 format!("{bind:?} must be src:dst[:ro|rw]"),
             ));
+        }
+        let src = parts[0];
+        let dst = parts[1];
+        if !dst.starts_with('/') || dst.split('/').any(|p| p == "..") {
+            return Err(CreateError::bad(
+                "bind",
+                format!("{bind:?} destination must be an absolute container path without '..'"),
+            ));
+        }
+        // If src is a named volume (not an absolute path)
+        if !src.starts_with('/') {
+            if let Err(e) = ingot_util::validate_resource_name(src) {
+                return Err(CreateError::bad("volume name", format!("{src:?}: {e}")));
+            }
         }
         if parts.len() == 3 && !matches!(parts[2].to_lowercase().as_str(), "ro" | "rw") {
             return Err(CreateError::bad(
@@ -353,10 +395,13 @@ fn validate_mounts(hc: &HostConfig) -> Result<(), CreateError> {
         if !matches!(typ, "bind" | "volume" | "tmpfs") {
             return Err(CreateError::unsupported(format!("mount type {typ:?}")));
         }
-        if m.Target.is_empty() || !m.Target.starts_with('/') {
+        if m.Target.is_empty()
+            || !m.Target.starts_with('/')
+            || m.Target.split('/').any(|p| p == "..")
+        {
             return Err(CreateError::bad(
                 "mount",
-                "Target must be a non-empty absolute path",
+                "Target must be a non-empty absolute path without '..'",
             ));
         }
         if typ == "bind" && !m.Source.starts_with('/') {
@@ -364,6 +409,14 @@ fn validate_mounts(hc: &HostConfig) -> Result<(), CreateError> {
                 "mount",
                 "bind Source must be an absolute host path",
             ));
+        }
+        if typ == "volume" && !m.Source.is_empty() && !m.Source.starts_with('/') {
+            if let Err(e) = ingot_util::validate_resource_name(&m.Source) {
+                return Err(CreateError::bad(
+                    "volume name",
+                    format!("{:?}: {e}", m.Source),
+                ));
+            }
         }
     }
     Ok(())
@@ -494,6 +547,90 @@ pub fn validate_hostconfig(hc: &HostConfig) -> Result<(), CreateError> {
             "MaximumRetryCount must not be negative",
         ));
     }
+    for opt in &hc.SecurityOpt {
+        if opt != "seccomp=unconfined"
+            && opt != "seccomp:unconfined"
+            && opt != "seccomp=default"
+            && opt != "seccomp:default"
+        {
+            return Err(CreateError::unsupported(format!("SecurityOpt {opt:?}")));
+        }
+    }
+    if !hc.VolumeDriver.is_empty() && hc.VolumeDriver != "local" {
+        return Err(CreateError::unsupported(format!(
+            "volume driver {:?}",
+            hc.VolumeDriver
+        )));
+    }
+    if !hc.VolumesFrom.is_empty() {
+        return Err(CreateError::unsupported("HostConfig.VolumesFrom"));
+    }
+    if !hc.GroupAdd.is_empty() {
+        return Err(CreateError::unsupported("HostConfig.GroupAdd"));
+    }
+    if !hc.ContainerIDFile.is_empty() {
+        return Err(CreateError::unsupported("HostConfig.ContainerIDFile"));
+    }
+    if !hc.LogConfig.typ.is_empty() && hc.LogConfig.typ != "json-file" {
+        return Err(CreateError::unsupported(format!(
+            "log driver {:?}",
+            hc.LogConfig.typ
+        )));
+    }
+    if !hc.IpcMode.is_empty() && hc.IpcMode != "private" && hc.IpcMode != "shareable" {
+        return Err(CreateError::unsupported(format!(
+            "IpcMode {:?}",
+            hc.IpcMode
+        )));
+    }
+    if !hc.Cgroup.is_empty() {
+        return Err(CreateError::unsupported("HostConfig.Cgroup"));
+    }
+    if !hc.Links.is_empty() {
+        return Err(CreateError::unsupported("HostConfig.Links"));
+    }
+    if hc.OomScoreAdj != 0 {
+        return Err(CreateError::unsupported("HostConfig.OomScoreAdj"));
+    }
+    if !hc.UTSMode.is_empty() && hc.UTSMode != "private" {
+        return Err(CreateError::unsupported(format!(
+            "UTSMode {:?}",
+            hc.UTSMode
+        )));
+    }
+    if !hc.UsernsMode.is_empty() {
+        return Err(CreateError::unsupported("HostConfig.UsernsMode"));
+    }
+    if !hc.Runtime.is_empty() && hc.Runtime != "runc" {
+        return Err(CreateError::unsupported(format!(
+            "Runtime {:?}",
+            hc.Runtime
+        )));
+    }
+    if !hc.Isolation.is_empty() && hc.Isolation != "default" {
+        return Err(CreateError::unsupported(format!(
+            "Isolation {:?}",
+            hc.Isolation
+        )));
+    }
+    if !hc.CgroupParent.is_empty() {
+        return Err(CreateError::unsupported("HostConfig.CgroupParent"));
+    }
+    if hc.BlkioWeight != 0 {
+        return Err(CreateError::unsupported("HostConfig.BlkioWeight"));
+    }
+    if hc.CpuPeriod != 0 {
+        return Err(CreateError::unsupported("HostConfig.CpuPeriod"));
+    }
+    if hc.CpuQuota != 0 {
+        return Err(CreateError::unsupported("HostConfig.CpuQuota"));
+    }
+    if !hc.CpusetMems.is_empty() {
+        return Err(CreateError::unsupported("HostConfig.CpusetMems"));
+    }
+    if hc.Init.is_some_and(|v| v) {
+        return Err(CreateError::unsupported("HostConfig.Init"));
+    }
     Ok(())
 }
 
@@ -506,6 +643,10 @@ mod tests {
             Image: "busybox:latest".to_string(),
             ..Default::default()
         }
+    }
+
+    fn validate_create(body: &ContainerCreateBody, name: Option<&str>) -> Result<(), CreateError> {
+        super::validate_create(body, name, None)
     }
 
     #[test]
@@ -717,6 +858,33 @@ mod tests {
             ..Default::default()
         }];
         assert!(validate_create(&b, None).is_err());
+
+        // Traversal rejection tests
+        let mut b = body();
+        b.HostConfig.Binds = vec!["/host:/data/../../etc".into()];
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.Binds = vec!["../evil:/data".into()];
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.Mounts = vec![ingot_api::MountRequest {
+            typ: "bind".into(),
+            Source: "/host".into(),
+            Target: "/data/../../etc".into(),
+            ..Default::default()
+        }];
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.Mounts = vec![ingot_api::MountRequest {
+            typ: "volume".into(),
+            Source: "my/evil/volume".into(),
+            Target: "/data".into(),
+            ..Default::default()
+        }];
+        assert!(validate_create(&b, None).is_err());
     }
 
     #[test]
@@ -771,6 +939,134 @@ mod tests {
         assert!(validate_create(&b, None).is_err());
         let mut b = body();
         b.StopTimeout = Some(-1);
+        assert!(validate_create(&b, None).is_err());
+    }
+
+    #[test]
+    fn platform_validation() {
+        let b = body();
+        assert!(super::validate_create(&b, None, None).is_ok());
+        assert!(super::validate_create(&b, None, Some("linux/amd64")).is_ok());
+        assert!(super::validate_create(&b, None, Some("linux")).is_ok());
+        assert!(super::validate_create(&b, None, Some("windows/amd64")).is_err());
+        assert!(super::validate_create(&b, None, Some("darwin/arm64")).is_err());
+    }
+
+    #[test]
+    fn security_opts_validation() {
+        let mut b = body();
+        b.HostConfig.SecurityOpt = vec!["seccomp=unconfined".into()];
+        assert!(validate_create(&b, None).is_ok());
+
+        let mut b = body();
+        b.HostConfig.SecurityOpt = vec!["seccomp:unconfined".into()];
+        assert!(validate_create(&b, None).is_ok());
+
+        let mut b = body();
+        b.HostConfig.SecurityOpt = vec!["seccomp=default".into()];
+        assert!(validate_create(&b, None).is_ok());
+
+        let mut b = body();
+        b.HostConfig.SecurityOpt = vec!["apparmor=unconfined".into()];
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.SecurityOpt = vec!["seccomp=/path/profile.json".into()];
+        assert!(validate_create(&b, None).is_err());
+    }
+
+    #[test]
+    fn unsupported_options_rejected() {
+        let mut b = body();
+        b.HostConfig.VolumeDriver = "nfs".into();
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.VolumesFrom = vec!["other".into()];
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.GroupAdd = vec!["wheel".into()];
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.ContainerIDFile = "/tmp/cid".into();
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.LogConfig.typ = "syslog".into();
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.IpcMode = "host".into();
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.Cgroup = "parent".into();
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.Links = vec!["redis:db".into()];
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.OomScoreAdj = 500;
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.UTSMode = "host".into();
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.UsernsMode = "host".into();
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.Runtime = "kata".into();
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.Isolation = "hyperv".into();
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.CgroupParent = "slice".into();
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.BlkioWeight = 500;
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.CpuPeriod = 100000;
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.CpuQuota = 50000;
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.CpusetMems = "0".into();
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.HostConfig.Init = Some(true);
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.Domainname = "example.com".into();
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.ArgsEscaped = true;
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.OnBuild = Some(vec!["RUN echo hi".into()]);
+        assert!(validate_create(&b, None).is_err());
+
+        let mut b = body();
+        b.Shell = Some(vec!["/bin/sh".into()]);
         assert!(validate_create(&b, None).is_err());
     }
 }

@@ -17,15 +17,21 @@ info() { echo -e "${BLUE}==>${NC} ${BOLD}$1${NC}"; }
 warn() { echo -e "${YELLOW}WARN:${NC} $1"; }
 fail() { echo -e "${RED}✗ FAIL:${NC} $1"; exit 1; }
 
-DOCKER_BIN="${DOCKER_BIN:-/tmp/dk}"
-INGOT_BIN="${INGOT_BIN:-/tmp/ig}"
+INGOT_SOCKET="${INGOT_SOCKET:-/run/ingot/ingot.sock}"
+REFERENCE_MODE=0
 
-if [ ! -x "$DOCKER_BIN" ]; then
-    fail "Docker CLI wrapper not found or not executable at $DOCKER_BIN"
-fi
-if [ ! -x "$INGOT_BIN" ]; then
-    fail "Ingot CLI wrapper not found or not executable at $INGOT_BIN"
-fi
+for arg in "$@"; do
+    case "$arg" in
+        --reference) REFERENCE_MODE=1 ;;
+        --socket=*)  INGOT_SOCKET="${arg#--socket=}" ;;
+        -h|--help)
+            echo "Usage: $0 [--reference] [--socket=PATH]"
+            echo "  --reference    Run comparative reference tests against Docker Engine (/var/run/docker.sock)"
+            echo "  --socket=PATH  Path to Ingot daemon socket (default: /run/ingot/ingot.sock)"
+            exit 0
+            ;;
+    esac
+done
 
 TEST_TMP="$(mktemp -d /tmp/ingot-interop-XXXXXX)"
 cleanup() {
@@ -34,10 +40,48 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [ -z "${INGOT_BIN:-}" ]; then
+    if [ -x "target/release/ingot" ]; then
+        INGOT_BIN="$(pwd)/target/release/ingot"
+    elif [ -x "target/debug/ingot" ]; then
+        INGOT_BIN="$(pwd)/target/debug/ingot"
+    elif [ -x "/tmp/ig" ]; then
+        INGOT_BIN="/tmp/ig"
+    elif command -v ingot >/dev/null 2>&1; then
+        INGOT_BIN="$(command -v ingot)"
+    else
+        fail "Ingot CLI not found. Build with cargo build -p ingot-cli or set INGOT_BIN."
+    fi
+fi
+
+if [ -z "${DOCKER_BIN:-}" ]; then
+    if [ -x "/tmp/dk" ]; then
+        DOCKER_BIN="/tmp/dk"
+    elif command -v docker >/dev/null 2>&1; then
+        DOCKER_BIN="$TEST_TMP/dk"
+        cat << EOF > "$DOCKER_BIN"
+#!/usr/bin/env bash
+exec docker -H "unix://$INGOT_SOCKET" "\$@"
+EOF
+        chmod +x "$DOCKER_BIN"
+    else
+        fail "docker CLI not found. Install docker CLI or set DOCKER_BIN."
+    fi
+fi
+
+if [ ! -x "$DOCKER_BIN" ]; then
+    fail "Docker CLI wrapper not found or not executable at $DOCKER_BIN"
+fi
+if [ ! -x "$INGOT_BIN" ]; then
+    fail "Ingot CLI wrapper not found or not executable at $INGOT_BIN"
+fi
+
 echo "======================================================================"
 echo " Starting Ingot End-to-End Interop Test Suite (Milestones M0 - M7)"
+echo " Socket:     $INGOT_SOCKET"
 echo " Docker CLI: $DOCKER_BIN"
 echo " Ingot CLI:  $INGOT_BIN"
+echo " Reference:  $REFERENCE_MODE"
 echo "======================================================================"
 
 # ------------------------------------------------------------------------------
@@ -46,7 +90,7 @@ echo "======================================================================"
 info "Testing M0: Ping, Version, and Info"
 
 # 1. Ping
-PING_RESP=$(curl -s --unix-socket /run/ingot/ingot.sock http://localhost/_ping)
+PING_RESP=$(curl -s --unix-socket "$INGOT_SOCKET" http://localhost/_ping)
 if [ "$PING_RESP" = "OK" ]; then
     pass "M0: Engine _ping returned OK"
 else
@@ -368,3 +412,67 @@ $DOCKER_BIN rmi interop-saveload:test >/dev/null
 echo "======================================================================"
 echo -e "${GREEN}${BOLD} ALL END-TO-END TESTS PASSED SUCCESSFULLY! (Milestones M0 - M7)${NC}"
 echo "======================================================================"
+
+if [ "$REFERENCE_MODE" = 1 ]; then
+    echo
+    echo "======================================================================"
+    info "Running Reference Comparison (Ingot vs Docker Engine)"
+    echo "======================================================================"
+    DOCKER_HOST_REAL="/var/run/docker.sock"
+    if [ ! -S "$DOCKER_HOST_REAL" ]; then
+        warn "Docker Engine socket $DOCKER_HOST_REAL not found or not a socket; skipping comparative reference run"
+    else
+        REF_DK="docker -H unix://$DOCKER_HOST_REAL"
+
+        # 1. Compare exit codes
+        info "Comparing container exit codes"
+        set +e
+        $REF_DK run --rm busybox sh -c 'exit 42' >/dev/null 2>&1
+        REF_EC=$?
+        $DOCKER_BIN run --rm busybox sh -c 'exit 42' >/dev/null 2>&1
+        INGOT_EC=$?
+        set -e
+        if [ "$REF_EC" = 42 ] && [ "$INGOT_EC" = 42 ]; then
+            pass "Exit code parity: both Docker ($REF_EC) and Ingot ($INGOT_EC) propagate exit code 42"
+        else
+            fail "Exit code mismatch: Docker=$REF_EC, Ingot=$INGOT_EC (expected 42)"
+        fi
+
+        # 2. Compare stdout and stderr stream separation
+        info "Comparing stream multiplexing separation"
+        REF_OUT=$($REF_DK run --rm busybox sh -c 'echo STDOUT_DATA; echo STDERR_DATA >&2' 2>/dev/null)
+        INGOT_OUT=$($DOCKER_BIN run --rm busybox sh -c 'echo STDOUT_DATA; echo STDERR_DATA >&2' 2>/dev/null)
+        if [ "$REF_OUT" = "STDOUT_DATA" ] && [ "$INGOT_OUT" = "STDOUT_DATA" ]; then
+            pass "Stream separation parity: stdout separated cleanly on both"
+        else
+            fail "Stream separation mismatch: Docker='$REF_OUT', Ingot='$INGOT_OUT'"
+        fi
+
+        # 3. Compare inspect structure
+        info "Comparing inspect JSON fields"
+        $REF_DK create --name ref-cmp-dk busybox:latest sleep 10 >/dev/null
+        $DOCKER_BIN create --name ref-cmp-ig busybox:latest sleep 10 >/dev/null
+
+        DK_STATUS=$($REF_DK inspect --format '{{.State.Status}}' ref-cmp-dk)
+        IG_STATUS=$($DOCKER_BIN inspect --format '{{.State.Status}}' ref-cmp-ig)
+        if [ "$DK_STATUS" = "created" ] && [ "$IG_STATUS" = "created" ]; then
+            pass "Inspect parity: State.Status='created' on both"
+        else
+            fail "Inspect status mismatch: Docker='$DK_STATUS', Ingot='$IG_STATUS'"
+        fi
+        $REF_DK rm ref-cmp-dk >/dev/null
+        $DOCKER_BIN rm ref-cmp-ig >/dev/null
+
+        # 4. Compare cleanup residue
+        info "Comparing cleanup residue after --rm run"
+        $DOCKER_BIN run --rm busybox:latest true
+        RESIDUE=$($DOCKER_BIN ps -a -q --filter "ancestor=busybox:latest")
+        if [ -z "$RESIDUE" ]; then
+            pass "Zero residue after --rm container execution"
+        else
+            fail "Residue left behind after --rm: $RESIDUE"
+        fi
+        echo -e "${GREEN}${BOLD}✓ REFERENCE COMPARISON TESTS PASSED${NC}"
+    fi
+fi
+

@@ -775,17 +775,35 @@ pub async fn get_tar_single(
 }
 
 /// POST /images/load
-pub async fn load_tar(State(state): State<SharedState>, body: axum::body::Bytes) -> Response {
-    let cursor = std::io::Cursor::new(body);
-    let mut archive = tar::Archive::new(cursor);
-
+pub async fn load_tar(State(state): State<SharedState>, body: axum::body::Body) -> Response {
     let tmp_dir = match tempfile::tempdir() {
         Ok(d) => d,
         Err(e) => return server_error(format!("failed to create temp dir: {e}")),
     };
 
-    if let Err(e) = archive.unpack(tmp_dir.path()) {
-        return bad_request(format!("failed to unpack tar archive: {e}"));
+    let temp_tar =
+        match crate::handlers::stream_body_to_temp_file(body, 10 * 1024 * 1024 * 1024).await {
+            Ok(f) => f,
+            Err(resp) => return resp,
+        };
+    let file = match temp_tar.reopen() {
+        Ok(f) => f,
+        Err(e) => return server_error(format!("failed to reopen temp tar: {e}")),
+    };
+
+    let mut archive = tar::Archive::new(std::io::BufReader::new(file));
+    let entries = match archive.entries() {
+        Ok(e) => e,
+        Err(e) => return bad_request(format!("failed to read tar entries: {e}")),
+    };
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(e) => e,
+            Err(e) => return bad_request(format!("malformed tar entry in image archive: {e}")),
+        };
+        if let Err(e) = entry.unpack_in(tmp_dir.path()) {
+            return bad_request(format!("failed to unpack image archive entry: {e}"));
+        }
     }
 
     let manifest_path = tmp_dir.path().join("manifest.json");
@@ -815,11 +833,17 @@ pub async fn load_tar(State(state): State<SharedState>, body: axum::body::Bytes)
     let mut output_lines = Vec::new();
 
     for item in manifests {
-        let config_file = tmp_dir.path().join(&item.Config);
-        let config_bytes = match std::fs::read(&config_file) {
+        let config_res =
+            match ingot_util::resolve_in_root(tmp_dir.path(), std::path::Path::new(&item.Config)) {
+                Ok(r) => r,
+                Err(e) => {
+                    return bad_request(format!("invalid image config path {:?}: {e}", item.Config))
+                }
+            };
+        let config_bytes = match std::fs::read(config_res.proc_path()) {
             Ok(b) => b,
             Err(e) => {
-                return server_error(format!("failed to read image config {}: {e}", item.Config))
+                return bad_request(format!("failed to read image config {}: {e}", item.Config))
             }
         };
         let config_val: serde_json::Value = match serde_json::from_slice(&config_bytes) {
@@ -838,22 +862,35 @@ pub async fn load_tar(State(state): State<SharedState>, body: axum::body::Bytes)
         let mut total_size: i64 = config_bytes.len() as i64;
 
         for layer_rel in item.Layers {
-            let layer_tar_path = tmp_dir.path().join(&layer_rel);
-            if !layer_tar_path.exists() {
-                continue;
-            }
-            let layer_bytes = std::fs::read(&layer_tar_path).unwrap_or_default();
+            let layer_res =
+                match ingot_util::resolve_in_root(tmp_dir.path(), std::path::Path::new(&layer_rel))
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return bad_request(format!(
+                            "missing or invalid layer {:?}: {e}",
+                            layer_rel
+                        ))
+                    }
+                };
+            let layer_tar_path = layer_res.proc_path();
+            let layer_bytes = match std::fs::read(layer_tar_path) {
+                Ok(b) => b,
+                Err(e) => return bad_request(format!("failed to read layer {layer_rel}: {e}")),
+            };
             let diff_hex = ingot_util::sha256_hex(&layer_bytes);
             let diff_id = format!("sha256:{diff_hex}");
             diff_ids.push(diff_id.clone());
 
             let layer_dir = state.paths.layer(&diff_id);
-            if !layer_dir.exists() {
-                let _ = std::fs::create_dir_all(&layer_dir);
-                let mut layer_arc = tar::Archive::new(std::io::Cursor::new(&layer_bytes));
-                layer_arc.set_preserve_permissions(true);
-                layer_arc.set_preserve_mtime(true);
-                let _ = layer_arc.unpack(&layer_dir);
+            if !layer_dir.exists() || !layer_dir.join(".ingot-unpacked").exists() {
+                if let Err(e) = ingot_image::unpack_layer_dir(
+                    layer_tar_path,
+                    &layer_dir,
+                    "application/vnd.oci.image.layer.v1.tar",
+                ) {
+                    return bad_request(format!("failed to unpack layer {layer_rel}: {e}"));
+                }
             }
 
             use flate2::write::GzEncoder;

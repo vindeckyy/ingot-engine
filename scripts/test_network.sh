@@ -21,15 +21,46 @@ info() { echo -e "${BLUE}==>${NC} ${BOLD}$1${NC}"; }
 warn() { echo -e "${YELLOW}WARN:${NC} $1"; }
 fail() { echo -e "${RED}✗ FAIL:${NC} $1"; exit 1; }
 
-DOCKER_BIN="${DOCKER_BIN:-/tmp/dk}"
+INGOT_SOCKET="${INGOT_SOCKET:-/run/ingot/ingot.sock}"
+DATA_ROOT="${DATA_ROOT:-/var/lib/ingot}"
+
+TEST_TMP="$(mktemp -d /tmp/ingot-network-XXXXXX)"
+
+if [ -z "${DOCKER_BIN:-}" ]; then
+    if [ -x "/tmp/dk" ]; then
+        DOCKER_BIN="/tmp/dk"
+    elif command -v docker >/dev/null 2>&1; then
+        DOCKER_BIN="$TEST_TMP/dk"
+        cat << EOF > "$DOCKER_BIN"
+#!/usr/bin/env bash
+exec docker -H "unix://$INGOT_SOCKET" "\$@"
+EOF
+        chmod +x "$DOCKER_BIN"
+    else
+        fail "docker CLI not found. Install docker CLI or set DOCKER_BIN."
+    fi
+fi
 [ -x "$DOCKER_BIN" ] || fail "Docker CLI wrapper not found at $DOCKER_BIN"
 
-LEASES=/var/lib/ingot/ipam-leases.json
-leases() { python3 -c "import json; print(sum(len(v) for v in json.load(open('$LEASES'))['allocated'].values()))"; }
-buckets() { python3 -c "import json; print(len(json.load(open('$LEASES'))['allocated']))"; }
+LEASES="${DATA_ROOT}/ipam-leases.json"
+leases() {
+    if [ ! -f "$LEASES" ]; then
+        echo "0"
+    else
+        python3 -c "import json; print(sum(len(v) for v in json.load(open('$LEASES'))['allocated'].values()))"
+    fi
+}
+buckets() {
+    if [ ! -f "$LEASES" ]; then
+        echo "0"
+    else
+        python3 -c "import json; print(len(json.load(open('$LEASES'))['allocated']))"
+    fi
+}
 veths() { ip -o link show | grep -c "veth-" || true; }
 
 cleanup() {
+    rm -rf "$TEST_TMP"
     $DOCKER_BIN rm -f v6-a v6-b v6-c v6-int v6-ctl v6-dup >/dev/null 2>&1 || true
     $DOCKER_BIN rm -f v6-p v6-q v6-lo v6-all >/dev/null 2>&1 || true
     $DOCKER_BIN rm -f v6-dns v6-dnsb v6-reg v6-srch V6-Upper >/dev/null 2>&1 || true

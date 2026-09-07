@@ -29,12 +29,12 @@ pub async fn version(State(_state): State<SharedState>) -> Response {
         Version: ingot_api::ENGINE_VERSION.into(),
         ApiVersion: ingot_api::API_VERSION.into(),
         MinAPIVersion: ingot_api::MIN_API_VERSION.into(),
-        GitCommit: "dev".into(),
-        GoVersion: "rustc-1.96".into(),
+        GitCommit: ingot_api::GIT_COMMIT.into(),
+        GoVersion: "rustc".into(),
         Os: "linux".into(),
         Arch: std::env::consts::ARCH.into(),
         KernelVersion: uname.2.clone(),
-        BuildTime: chrono::Utc::now().to_rfc3339(),
+        BuildTime: ingot_api::BUILD_TIME.into(),
         Components: Some(vec![VersionComponent {
             Name: "Engine".into(),
             Version: ingot_api::ENGINE_VERSION.into(),
@@ -48,10 +48,10 @@ pub async fn version(State(_state): State<SharedState>) -> Response {
                     ("Arch".to_string(), std::env::consts::ARCH.to_string()),
                     ("Os".to_string(), "linux".to_string()),
                     ("Experimental".to_string(), "false".to_string()),
-                    ("GitCommit".to_string(), "dev".to_string()),
+                    ("GitCommit".to_string(), ingot_api::GIT_COMMIT.to_string()),
                     ("GoVersion".to_string(), "rustc".to_string()),
                     ("KernelVersion".to_string(), uname.2.clone()),
-                    ("BuildTime".to_string(), chrono::Utc::now().to_rfc3339()),
+                    ("BuildTime".to_string(), ingot_api::BUILD_TIME.to_string()),
                 ]
                 .into_iter()
                 .collect(),
@@ -61,10 +61,93 @@ pub async fn version(State(_state): State<SharedState>) -> Response {
     axum::Json(v).into_response()
 }
 
+struct HostCapabilities {
+    cgroup_v2: bool,
+    memory_limit: bool,
+    swap_limit: bool,
+    kernel_memory_tcp: bool,
+    cpu_cfs_period: bool,
+    cpu_cfs_quota: bool,
+    cpu_shares: bool,
+    cpuset: bool,
+    pids_limit: bool,
+    oom_kill_disable: bool,
+    ipv4_forwarding: bool,
+    bridge_nf_iptables: bool,
+    bridge_nf_ip6tables: bool,
+    security_options: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn detect_host_capabilities() -> HostCapabilities {
+    let controllers =
+        std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").unwrap_or_default();
+    let controller_list: Vec<&str> = controllers.split_whitespace().collect();
+    let cgroup_v2 = !controllers.is_empty();
+
+    let has_memory = controller_list.contains(&"memory");
+    let has_cpu = controller_list.contains(&"cpu");
+    let has_cpuset = controller_list.contains(&"cpuset");
+    let has_pids = controller_list.contains(&"pids");
+
+    let swap_limit = has_memory && std::path::Path::new("/sys/fs/cgroup/memory.swap.max").exists();
+
+    // IPv4 forwarding
+    let ipv4_forwarding = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
+
+    // Bridge netfilter iptables calls
+    let bridge_nf_iptables =
+        std::fs::read_to_string("/proc/sys/net/bridge/bridge-nf-call-iptables")
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
+
+    let bridge_nf_ip6tables =
+        std::fs::read_to_string("/proc/sys/net/bridge/bridge-nf-call-ip6tables")
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false);
+
+    let mut warnings = Vec::new();
+    if !ipv4_forwarding {
+        warnings.push("WARNING: IPv4 forwarding is disabled".into());
+    }
+    if !bridge_nf_iptables {
+        warnings.push("WARNING: bridge-nf-call-iptables is disabled".into());
+    }
+    if !bridge_nf_ip6tables {
+        warnings.push("WARNING: bridge-nf-call-ip6tables is disabled".into());
+    }
+    if !cgroup_v2 {
+        warnings.push("WARNING: cgroup v2 is not mounted or available".into());
+    }
+
+    // Security options: default seccomp profile is enforced
+    let security_options = vec!["name=seccomp,profile=default".into()];
+
+    HostCapabilities {
+        cgroup_v2,
+        memory_limit: has_memory,
+        swap_limit,
+        kernel_memory_tcp: has_memory,
+        cpu_cfs_period: has_cpu,
+        cpu_cfs_quota: has_cpu,
+        cpu_shares: has_cpu,
+        cpuset: has_cpuset,
+        pids_limit: has_pids,
+        oom_kill_disable: false,
+        ipv4_forwarding,
+        bridge_nf_iptables,
+        bridge_nf_ip6tables,
+        security_options,
+        warnings,
+    }
+}
+
 pub async fn info(State(state): State<SharedState>) -> Response {
     let uname = uname_info();
     let (nproc, memtotal) = sys_info();
-    let cgroup_v2 = std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").is_ok();
+    let caps = detect_host_capabilities();
     let (n_containers, n_running, n_paused, n_images) = census(&state).await;
     let info = Info {
         ID: daemon_id(&state),
@@ -79,24 +162,28 @@ pub async fn info(State(state): State<SharedState>) -> Response {
             vec!["Supports d_type".into(), "true".into()],
         ],
         DockerRootDir: state.paths.root.display().to_string(),
-        MemoryLimit: true,
-        SwapLimit: true,
-        KernelMemoryTCP: true,
-        CpuCfsPeriod: true,
-        CpuCfsQuota: true,
-        CPUShares: true,
-        CPUSet: true,
-        PidsLimit: true,
-        OomKillDisable: true,
-        IPv4Forwarding: true,
-        BridgeNfIptables: true,
-        BridgeNfIp6tables: true,
+        MemoryLimit: caps.memory_limit,
+        SwapLimit: caps.swap_limit,
+        KernelMemoryTCP: caps.kernel_memory_tcp,
+        CpuCfsPeriod: caps.cpu_cfs_period,
+        CpuCfsQuota: caps.cpu_cfs_quota,
+        CPUShares: caps.cpu_shares,
+        CPUSet: caps.cpuset,
+        PidsLimit: caps.pids_limit,
+        OomKillDisable: caps.oom_kill_disable,
+        IPv4Forwarding: caps.ipv4_forwarding,
+        BridgeNfIptables: caps.bridge_nf_iptables,
+        BridgeNfIp6tables: caps.bridge_nf_ip6tables,
         Debug: state.config.debug,
         NFd: 0,
         NGoroutines: 0,
         LoggingDriver: "json-file".into(),
         CgroupDriver: "cgroupfs".into(),
-        CgroupVersion: if cgroup_v2 { "2".into() } else { "1".into() },
+        CgroupVersion: if caps.cgroup_v2 {
+            "2".into()
+        } else {
+            "1".into()
+        },
         NEventsListener: state
             .event_listeners
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -114,9 +201,9 @@ pub async fn info(State(state): State<SharedState>) -> Response {
         ExperimentalBuild: false,
         RuntimesMap: serde_json::json!({"ingot": {"path": "ingot"}}),
         DefaultRuntime: "ingot".into(),
-        SecurityOptions: vec!["name=seccomp,profile=default".into()],
+        SecurityOptions: caps.security_options,
         CDISpecDirs: vec![],
-        Warnings: vec![],
+        Warnings: caps.warnings,
     };
     axum::Json(info).into_response()
 }

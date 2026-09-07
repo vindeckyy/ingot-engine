@@ -248,7 +248,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for HashingWriter<W> {
     }
 }
 
-enum Challenge {
+pub enum Challenge {
     Bearer {
         realm: String,
         service: String,
@@ -308,7 +308,7 @@ impl RegistryClient {
         out
     }
 
-    fn parse_challenge(header: &str) -> Result<Challenge> {
+    pub fn parse_challenge(header: &str) -> Result<Challenge> {
         let header = header.trim();
         if let Some(rest) = header.strip_prefix("Bearer") {
             let mut realm = String::new();
@@ -1226,5 +1226,14 @@ mod tests {
         // Other failures truncate the body.
         let e = manifest_error(500, &"x".repeat(1000), &img()).to_string();
         assert!(e.len() < 600, "body must be truncated: {}", e.len());
+    }
+
+    #[test]
+    fn parse_challenge_handles_variations_and_malformed() {
+        assert!(RegistryClient::parse_challenge("Bearer realm=\"https://auth.docker.io/token\",service=\"registry.docker.io\",scope=\"repository:library/busybox:pull\"").is_ok());
+        assert!(RegistryClient::parse_challenge("Basic realm=\"Registry Realm\"").is_ok());
+        assert!(RegistryClient::parse_challenge("").is_err());
+        assert!(RegistryClient::parse_challenge("Digest foo=bar").is_err());
+        assert!(RegistryClient::parse_challenge("Bearer service=\"foo\"").is_err());
     }
 }

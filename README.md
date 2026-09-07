@@ -12,7 +12,7 @@
 
 ---
 
-Ingot is a container engine that implements the Docker Engine API (v1.24 through v1.44) from scratch in Rust. It runs a root daemon (`ingotd`) that listens on a Unix domain socket (`/run/ingot/ingot.sock`) and ships a CLI (`ingot`) that speaks the same protocol. The official Docker CLI (`docker` v27+) works unmodified against it.
+Ingot is a container engine that implements a focused subset of the Docker Engine API (v1.44) from scratch in Rust. It runs a root daemon (`ingotd`) that listens on a Unix domain socket (`/run/ingot/ingot.sock`) and ships a companion CLI (`ingot`) that speaks the same protocol. The official Docker CLI (`docker` v27+) works unmodified against it for supported endpoints.
 
 Ingot has no external runtime dependency on `runc`, `crun`, `youki`, or `libcontainer`. Namespace isolation, cgroups v2 resource control, overlayfs storage, bridge networking, embedded DNS, json-file logging, multiplexed stream hijacking, Dockerfile building, and Compose orchestration are all implemented in-repo.
 
@@ -94,7 +94,7 @@ Ingot is a from-scratch engine built for learning and hardening. It runs real co
                     +--------------+-------------+
                                    |
                                    | Unix Domain Socket (/run/ingot/ingot.sock)
-                                   | Docker Engine API (v1.24 - v1.44)
+                                   | Docker Engine API (v1.44)
                                    v
                  +----------------------------------+
                  |         Ingotd Daemon            |
@@ -239,11 +239,13 @@ The Compose engine (`ingot-cli`) parses `compose.yaml` / `docker-compose.yml`, r
 
 ## On-Disk Layout
 
-All persistent state lives under `/var/lib/ingot` by default. Runtime state (socket, netns bind mounts, PID file) lives under `/run/ingot`.
+All persistent state lives under `/var/lib/ingot` by default. Runtime state (socket, netns bind mounts, daemon lock) lives under `/run/ingot`.
+A root-daemon exclusive lock is held at `/var/lib/ingot/ingotd.lock` and `/run/ingot/ingotd.lock` for the daemon lifetime to prevent concurrent mutations.
 
 | Path | Contents |
 |---|---|
 | `/var/lib/ingot/schema-version` | Schema version marker for migration discipline |
+| `/var/lib/ingot/ingotd.lock` | Data-root exclusive lock file |
 | `/var/lib/ingot/blobs/sha256/<hex>` | Content-addressed image blobs |
 | `/var/lib/ingot/layers/<hex>` | Unpacked image layers |
 | `/var/lib/ingot/images/<id>.json` | Image records (config, rootfs, history) |
@@ -266,9 +268,9 @@ All persistent state lives under `/var/lib/ingot` by default. Runtime state (soc
 | `/var/lib/ingot/builder/cache.json` | Build cache index |
 | `/var/lib/ingot/builder/contexts/` | Build context scratch |
 | `/var/lib/ingot/builder/steps/` | Per-build step scratch |
-| `/run/ingot/ingot.sock` | Unix domain socket |
+| `/run/ingot/ingot.sock` | Unix domain socket (mode 0600 root-only by default) |
 | `/run/ingot/netns/` | Runtime netns bind mounts |
-| `/run/ingot/ingotd.pid` | Daemon PID file |
+| `/run/ingot/ingotd.lock` | Run-root exclusive lock file |
 
 ## Getting Started
 
@@ -692,7 +694,6 @@ The Compose engine resolves service dependencies, creates dedicated bridge netwo
 | `info` | Print daemon info |
 | `run` | Create and start a container |
 | `pull` | Pull an image |
-| `push` | Push an image |
 | `login` | Authenticate to a registry |
 | `logout` | Clear registry credentials |
 | `ps` | List containers |
@@ -710,6 +711,7 @@ The Compose engine resolves service dependencies, creates dedicated bridge netwo
 | `network` | Manage networks (`ls`, `create`, `rm`, `inspect`, `connect`, `disconnect`, `prune`) |
 | `volume` | Manage volumes (`ls`, `create`, `rm`, `inspect`, `prune`) |
 | `system` | System commands (`df`, `prune`) |
+| `doctor` | Diagnose host environment, socket access, kernel capabilities, and daemon health |
 | `completions` | Generate shell completions (`bash`, `zsh`, `fish`, `elvish`, `powershell`) |
 
 ### `run` Flags
@@ -782,6 +784,17 @@ export DOCKER_HOST=unix:///run/ingot/ingot.sock
 The interop suite covers M0 through M7: ping/version/info, image pull/list/inspect/tag/rmi, container run/create/start/exec/logs/stop/rm, user bridges and port mapping, DNS resolution, multi-stage builds with layer caching, volumes and healthchecks, `top` and `stats`, Compose up/ps/logs/down, `cp`, `save`/`load`, and prune.
 
 Tier 2 requires root, a running `ingotd`, and host networking/firewall access. Run it on a disposable host or VM.
+
+### Benchmarking
+
+A reproducible benchmark harness compares binary footprint, idle daemon RSS, ping latency, and container lifecycle throughput:
+
+```bash
+./scripts/benchmark.sh               # Run standard benchmark suite
+./scripts/benchmark.sh --no-docker   # Skip comparison with local Docker Engine
+```
+
+Results are saved as structured JSON artifacts under `benchmarks/results/`.
 
 ## Contributing
 

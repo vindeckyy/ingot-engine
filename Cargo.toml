@@ -57,6 +57,7 @@ regex = "1"
 tempfile = "3"
 byteorder = "1"
 tower = { version = "0.5", features = ["util"] }
+seccompiler = "0.5.0"
 
 # internal
 ingot-util = { path = "crates/util" }

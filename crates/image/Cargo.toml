@@ -21,3 +21,7 @@ ingot-util.workspace = true
 ingot-registry.workspace = true
 ingot-store.workspace = true
 ingot-api.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

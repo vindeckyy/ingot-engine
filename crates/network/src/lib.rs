@@ -170,7 +170,7 @@ fn host_port_free(host_ip: &str, port: u16, proto: &str) -> bool {
 /// Idempotent iptables rule: `-C` first, then `-I` (insert, for filters
 /// that must precede generic ACCEPTs) or `-A` (append) on miss. Never
 /// duplicates across re-ensures or daemon restarts.
-fn iptables_ensure(table: Option<&str>, insert: bool, rule: &[&str]) {
+fn iptables_ensure(table: Option<&str>, insert: bool, rule: &[&str]) -> Result<()> {
     let mut check: Vec<&str> = Vec::new();
     if let Some(t) = table {
         check.extend(["-t", t]);
@@ -184,8 +184,9 @@ fn iptables_ensure(table: Option<&str>, insert: bool, rule: &[&str]) {
         }
         add.push(if insert { "-I" } else { "-A" });
         add.extend(rule.iter());
-        let _ = sh("iptables", &add);
+        sh("iptables", &add)?;
     }
+    Ok(())
 }
 
 pub fn sh(cmd: &str, args: &[&str]) -> Result<String> {
@@ -205,8 +206,10 @@ pub fn sh(cmd: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-fn enable_ip_forward() {
-    let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
+fn enable_ip_forward() -> Result<()> {
+    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")
+        .context("failed to enable /proc/sys/net/ipv4/ip_forward")?;
+    Ok(())
 }
 
 /// One network's name → ip registry, shared with its DNS server task.
@@ -258,7 +261,7 @@ impl NetworkManager {
 
     /// Boot: load/create the default bridge network.
     pub async fn boot(&self) -> Result<()> {
-        enable_ip_forward();
+        enable_ip_forward()?;
         if let Ok(rd) = std::fs::read_dir(self.paths.networks()) {
             for entry in rd.flatten() {
                 if let Ok(data) = std::fs::read(entry.path()) {
@@ -503,7 +506,7 @@ impl NetworkManager {
                     "-j",
                     "DROP",
                 ],
-            );
+            )?;
             iptables_ensure(
                 None,
                 true,
@@ -517,7 +520,7 @@ impl NetworkManager {
                     "-j",
                     "DROP",
                 ],
-            );
+            )?;
             // Bridge-local hairpin still allowed (policy-independent).
             iptables_ensure(
                 None,
@@ -531,7 +534,7 @@ impl NetworkManager {
                     "-j",
                     "ACCEPT",
                 ],
-            );
+            )?;
         } else {
             // NAT for this subnet.
             iptables_ensure(
@@ -547,10 +550,10 @@ impl NetworkManager {
                     "-j",
                     "MASQUERADE",
                 ],
-            );
+            )?;
             // Allow forwarded traffic in/out of this bridge.
-            iptables_ensure(None, false, &["FORWARD", "-i", &rec.bridge, "-j", "ACCEPT"]);
-            iptables_ensure(None, false, &["FORWARD", "-o", &rec.bridge, "-j", "ACCEPT"]);
+            iptables_ensure(None, false, &["FORWARD", "-i", &rec.bridge, "-j", "ACCEPT"])?;
+            iptables_ensure(None, false, &["FORWARD", "-o", &rec.bridge, "-j", "ACCEPT"])?;
         }
         Ok(())
     }

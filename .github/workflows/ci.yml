@@ -31,14 +31,31 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: cargo fmt --check
-        run: cargo fmt --check
+      - name: Run strict checks
+        run: ./scripts/check.sh --strict
 
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+  audit:
+    name: security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: cargo test --workspace
-        run: cargo test --workspace
+      - name: Install cargo-audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  fuzz-smoke:
+    name: fuzz targets build smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Check fuzz targets
+        run: cargo check --manifest-path fuzz/Cargo.toml
 
   build-binaries:
     name: build ingotd + ingot
@@ -58,5 +75,75 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-binaries-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build daemon and CLI
-        run: cargo build -p ingotd -p ingot-cli
+      - name: Build release binaries
+        run: cargo build --release -p ingotd -p ingot-cli
+
+      - name: Generate Checksums
+        run: |
+          cd target/release
+          sha256sum ingotd ingot > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingot-linux-amd64
+          path: |
+            target/release/ingotd
+            target/release/ingot
+            target/release/SHA256SUMS
+
+  privileged-interop:
+    name: privileged e2e interop & network
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-priv-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binaries
+        run: cargo build --release -p ingotd -p ingot-cli
+
+      - name: Run privileged interop suite
+        run: |
+          TEMP_ROOT=$(mktemp -d /tmp/ingot-ci-XXXXXX)
+          DATA_DIR="$TEMP_ROOT/data"
+          RUN_DIR="$TEMP_ROOT/run"
+          SOCKET="$RUN_DIR/ingot.sock"
+          mkdir -p "$DATA_DIR" "$RUN_DIR"
+
+          sudo ./target/release/ingotd --data-root "$DATA_DIR" --run-root "$RUN_DIR" --listen "unix://$SOCKET" &
+          DAEMON_PID=$!
+
+          cleanup() {
+            echo "Stopping daemon PID $DAEMON_PID"
+            sudo kill "$DAEMON_PID" 2>/dev/null || true
+            wait "$DAEMON_PID" 2>/dev/null || true
+            sudo rm -rf "$TEMP_ROOT"
+          }
+          trap cleanup EXIT
+
+          echo "Waiting for daemon readiness on $SOCKET..."
+          for i in $(seq 1 30); do
+            if sudo curl -s --unix-socket "$SOCKET" http://localhost/_ping | grep -q "OK"; then
+              echo "Daemon ready."
+              break
+            fi
+            sleep 0.5
+          done
+
+          echo "Running end-to-end interop test..."
+          sudo INGOT_SOCKET="$SOCKET" ./scripts/test_interop.sh --socket="$SOCKET"
+          echo "Running networking test suite..."
+          sudo INGOT_SOCKET="$SOCKET" DATA_ROOT="$DATA_DIR" ./scripts/test_network.sh
+

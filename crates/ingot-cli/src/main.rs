@@ -156,9 +156,17 @@ enum Cmd {
     /// Run a command in a running container
     Exec {
         container: String,
+        /// Keep STDIN open
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Allocate a TTY
+        #[arg(short = 't', long)]
+        tty: bool,
         /// Command
         cmd: Vec<String>,
     },
+    /// Check system requirements and engine health
+    Doctor,
     /// Build an image from a Dockerfile
     Build {
         /// Name and optionally tag (repeatable)
@@ -464,7 +472,12 @@ async fn main() -> Result<()> {
             follow,
             tail,
         } => commands::logs(&api, &container, follow, tail).await,
-        Cmd::Exec { container, cmd } => commands::exec(&api, &container, cmd).await,
+        Cmd::Exec {
+            container,
+            interactive,
+            tty,
+            cmd,
+        } => commands::exec(&api, &container, interactive, tty, cmd).await,
         Cmd::Build {
             tags,
             dockerfile,
@@ -557,6 +570,7 @@ async fn main() -> Result<()> {
             SystemSubcmd::Df => commands::system_df(&api).await,
             SystemSubcmd::Prune { force } => commands::system_prune(&api, force).await,
         },
+        Cmd::Doctor => commands::doctor(&api, &socket).await,
         Cmd::Completions { .. } => unreachable!(),
     }
 }

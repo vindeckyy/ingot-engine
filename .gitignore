@@ -1,4 +1,6 @@
 /target
+/fuzz/target
+benchmarks/results/
 **/*.rs.bk
 *.tar
 *.log

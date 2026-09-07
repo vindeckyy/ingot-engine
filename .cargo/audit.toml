@@ -1,0 +1,5 @@
+[advisories]
+ignore = [
+    # paste 1.0.15 unmaintained, transitive netlink stack dependency
+    "RUSTSEC-2024-0436",
+]

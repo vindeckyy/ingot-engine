@@ -4,9 +4,14 @@ pub mod digest;
 pub mod id;
 pub mod ignore;
 pub mod name;
+pub mod path;
 
 pub use digest::{digest_hex, sha256_hex};
 pub use id::random_token;
+pub use path::{
+    clean_relative_path, ensure_dir_in_root, ensure_file_in_root, resolve_in_root,
+    validate_container_name, validate_resource_name, ResolvedPath,
+};
 
 use anyhow::{Context, Result};
 use std::path::Path;

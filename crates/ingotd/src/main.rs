@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ingot_server::{DaemonConfig, DaemonState};
-use ingot_store::paths::DataPaths;
+use ingot_store::{paths::DataPaths, DaemonLock};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,6 +24,13 @@ struct Args {
     /// Default bridge interface name.
     #[arg(long, default_value = "ingot0")]
     bridge: String,
+    /// Group owner for the Unix socket (e.g. "docker" or "ingot"). Defaults to
+    /// root-only access (mode 0600).
+    ///
+    /// WARNING: Any user with access to the Ingot socket has effective root
+    /// privileges on the host.
+    #[arg(long)]
+    socket_group: Option<String>,
     /// Verify image-store consistency (read-only) and exit.
     #[arg(long)]
     fsck: bool,
@@ -62,6 +69,15 @@ async fn main() -> Result<()> {
 
     let paths = DataPaths::new(&args.data_root, &args.run_root);
     if args.fsck || args.repair {
+        let _lock = if args.repair {
+            // Image repair modifies the store; refuse if daemon is live
+            Some(
+                DaemonLock::acquire(&args.data_root, &args.run_root)
+                    .context("cannot repair image store while ingotd is running")?,
+            )
+        } else {
+            None
+        };
         let report = if args.repair {
             ingot_image::fsck::repair(&paths, &args.run_root)?
         } else {
@@ -74,6 +90,10 @@ async fn main() -> Result<()> {
         }
         anyhow::bail!("fsck: {} problem(s) found", report.errors.len());
     }
+
+    // Acquire exclusive daemon lock on data_root and run_root before proceeding
+    let _daemon_lock = DaemonLock::acquire(&args.data_root, &args.run_root)?;
+
     paths.create_all().context("initialise data root")?;
     paths
         .check_schema_version()
@@ -119,7 +139,7 @@ async fn main() -> Result<()> {
         args.socket.display()
     );
 
-    ingot_server::serve::serve(state, &args.socket).await
+    ingot_server::serve::serve(state, &args.socket, args.socket_group.as_deref()).await
 }
 
 /// On boot: stale "running" containers died with the daemon. Supervised
@@ -254,19 +274,45 @@ fn sweep_builder_scratch(paths: &DataPaths) {
     }
 }
 
-fn check_environment(paths: &DataPaths) -> Result<()> {
-    let cgroup_v2 = std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").is_ok();
-    if !cgroup_v2 {
-        tracing::warn!("cgroup v2 not detected — container resource limits will be unavailable");
+fn check_binary(bin: &str) -> Result<()> {
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    for p in std::env::split_paths(&paths) {
+        let cand = p.join(bin);
+        if cand.is_file() {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = cand.metadata() {
+                if meta.permissions().mode() & 0o111 != 0 {
+                    return Ok(());
+                }
+            }
+        }
     }
+    anyhow::bail!("required host utility '{bin}' not found in PATH");
+}
+
+fn check_environment(paths: &DataPaths) -> Result<()> {
+    if std::fs::metadata("/sys/fs/cgroup").is_err() {
+        anyhow::bail!("/sys/fs/cgroup is not mounted; cannot manage containers");
+    }
+    let cgroup_v2 = std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers")
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !cgroup_v2 {
+        anyhow::bail!(
+            "cgroup v2 is required but not available on /sys/fs/cgroup \
+             (Ingot requires cgroup v2 unified hierarchy)"
+        );
+    }
+
+    for bin in ["ip", "iptables", "modprobe"] {
+        check_binary(bin)?;
+    }
+
     if !overlay_works() {
         anyhow::bail!(
             "overlayfs test mount failed; the kernel overlay module is required \
              (try: modprobe overlay)"
         );
-    }
-    if std::fs::metadata("/sys/fs/cgroup").is_err() {
-        anyhow::bail!("/sys/fs/cgroup is not mounted; cannot manage containers");
     }
     let _ = paths;
     Ok(())

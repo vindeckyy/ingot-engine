@@ -15,3 +15,5 @@ use std::path::Path;
 pub fn unpack_layer_dir(blob_path: &Path, dest_dir: &Path, media_type: &str) -> Result<String> {
     unpack::unpack_layer(blob_path, dest_dir, media_type)
 }
+
+pub use unpack::unpack_entries;

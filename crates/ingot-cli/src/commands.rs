@@ -279,11 +279,22 @@ pub async fn logout(server: &str) -> Result<()> {
 
 /// POST /images/create and print the docker-style progress stream.
 pub async fn pull(api: &ApiClient, image: &str, platform: Option<&str>) -> Result<()> {
-    let (repo, tag) = match image.split_once(':') {
-        Some((r, t)) => (r, t),
-        None => (image, "latest"),
+    let parsed = ingot_registry::ImageRef::parse(image)?;
+    let repo_part = if parsed.registry_is_default() {
+        parsed.repo.clone()
+    } else {
+        format!("{}/{}", parsed.registry, parsed.repo)
     };
-    let mut url = format!("/images/create?fromImage={repo}&tag={tag}");
+    let tag_or_digest = if let Some(ref d) = parsed.digest {
+        d.clone()
+    } else {
+        parsed.tag.unwrap_or_else(|| "latest".to_string())
+    };
+    let mut url = format!(
+        "/images/create?fromImage={}&tag={}",
+        url_escape(&repo_part),
+        url_escape(&tag_or_digest)
+    );
     if let Some(p) = platform {
         url.push_str("&platform=");
         url.push_str(p);
@@ -372,6 +383,34 @@ pub async fn run(api: &ApiClient, opts: &RunOpts, image: &str, cmd: Vec<String>)
         .ok_or_else(|| anyhow!("create failed"))?
         .to_string();
 
+    if opts.detach {
+        println!("{id}");
+        return Ok(());
+    }
+
+    if opts.interactive {
+        let attach_url = format!("/containers/{id}/attach?stream=1&stdin=1&stdout=1&stderr=1");
+        let upgraded = api.upgrade_stream(&attach_url, None).await?;
+        if let Err(e) = api
+            .request_raw("POST", &format!("/containers/{id}/start"), None)
+            .await
+        {
+            let _ = api
+                .request_raw("DELETE", &format!("/containers/{id}?force=1"), None)
+                .await;
+            return Err(e);
+        }
+        crate::client::run_attached_stream(upgraded, opts.tty, true).await?;
+        let wait = api
+            .request_json("POST", &format!("/containers/{id}/wait"), None)
+            .await?;
+        let code = wait["StatusCode"].as_i64().unwrap_or(0);
+        if code != 0 {
+            std::process::exit(code as i32);
+        }
+        return Ok(());
+    }
+
     if let Err(e) = api
         .request_raw("POST", &format!("/containers/{id}/start"), None)
         .await
@@ -380,11 +419,6 @@ pub async fn run(api: &ApiClient, opts: &RunOpts, image: &str, cmd: Vec<String>)
             .request_raw("DELETE", &format!("/containers/{id}?force=1"), None)
             .await;
         return Err(e);
-    }
-
-    if opts.detach {
-        println!("{id}");
-        return Ok(());
     }
 
     // Follow the framed log stream concurrently; exit when the container does.
@@ -431,7 +465,11 @@ pub async fn run(api: &ApiClient, opts: &RunOpts, image: &str, cmd: Vec<String>)
         .await?;
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     printer.abort();
-    std::process::exit(wait["StatusCode"].as_i64().unwrap_or(0) as i32);
+    let code = wait["StatusCode"].as_i64().unwrap_or(0);
+    if code != 0 {
+        std::process::exit(code as i32);
+    }
+    Ok(())
 }
 
 pub async fn stop(api: &ApiClient, containers: &[String]) -> Result<()> {
@@ -513,7 +551,13 @@ pub async fn logs(
     Ok(())
 }
 
-pub async fn exec(api: &ApiClient, container: &str, cmd: Vec<String>) -> Result<()> {
+pub async fn exec(
+    api: &ApiClient,
+    container: &str,
+    interactive: bool,
+    tty: bool,
+    cmd: Vec<String>,
+) -> Result<()> {
     if cmd.is_empty() {
         return Err(anyhow!("no command specified"));
     }
@@ -521,8 +565,10 @@ pub async fn exec(api: &ApiClient, container: &str, cmd: Vec<String>) -> Result<
         .post(
             &format!("/containers/{container}/exec"),
             Some(serde_json::json!({
+                "AttachStdin": interactive,
                 "AttachStdout": true,
                 "AttachStderr": true,
+                "Tty": tty,
                 "Cmd": cmd,
             })),
         )
@@ -531,26 +577,29 @@ pub async fn exec(api: &ApiClient, container: &str, cmd: Vec<String>) -> Result<
         .as_str()
         .ok_or_else(|| anyhow!("no exec id"))?
         .to_string();
-    // Hijacked start would need raw duplex; for M2 use the logs-less variant:
-    // start detached then report exit via inspect polling.
-    api.post::<serde_json::Value>(
-        &format!("/exec/{eid}/start"),
-        Some(serde_json::json!({"Detach": false, "Tty": false})),
-    )
-    .await
-    .ok();
-    // Poll exec inspect for exit code.
-    loop {
-        let insp = api
-            .get_json::<serde_json::Value>(&format!("/exec/{eid}/json"))
-            .await?;
-        let running = insp["Running"].as_bool().unwrap_or(false);
-        if !running {
-            let code = insp["ExitCode"].as_i64().unwrap_or(0);
-            std::process::exit(code as i32);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let start_body = serde_json::json!({
+        "Detach": false,
+        "Tty": tty,
+    });
+    let upgraded = api
+        .upgrade_stream(
+            &format!("/exec/{eid}/start"),
+            Some(serde_json::to_vec(&start_body)?),
+        )
+        .await?;
+
+    crate::client::run_attached_stream(upgraded, tty, interactive).await?;
+
+    // Fetch exit code from inspect
+    let insp = api
+        .get_json::<serde_json::Value>(&format!("/exec/{eid}/json"))
+        .await?;
+    let code = insp["ExitCode"].as_i64().unwrap_or(0);
+    if code != 0 {
+        std::process::exit(code as i32);
     }
+    Ok(())
 }
 
 /// Tar the build context (honouring .dockerignore) and stream /build.
@@ -768,12 +817,14 @@ pub async fn rmi(api: &ApiClient, force: bool, images: &[String]) -> Result<()> 
 }
 
 pub async fn tag(api: &ApiClient, source: &str, target: &str) -> Result<()> {
-    let (repo, tag) = match target.split_once(':') {
-        Some((r, t)) => (r, Some(t)),
-        None => (target, None),
+    let parsed = ingot_registry::ImageRef::parse(target)?;
+    let repo_part = if parsed.registry_is_default() {
+        parsed.repo.clone()
+    } else {
+        format!("{}/{}", parsed.registry, parsed.repo)
     };
-    let mut url = format!("/images/{source}/tag?repo={}", url_escape(repo));
-    if let Some(t) = tag {
+    let mut url = format!("/images/{source}/tag?repo={}", url_escape(&repo_part));
+    if let Some(ref t) = parsed.tag {
         url.push_str(&format!("&tag={}", url_escape(t)));
     }
     api.request_raw("POST", &url, None).await?;
@@ -1110,4 +1161,114 @@ fn url_escape(s: &str) -> String {
         }
     }
     out
+}
+
+pub async fn doctor(api: &ApiClient, socket_path: &std::path::Path) -> Result<()> {
+    println!("Checking Ingot system requirements and health...\n");
+    let mut all_ok = true;
+
+    // 1. Socket & daemon connection
+    print!("  [..] Ingot daemon connection: ");
+    if !socket_path.exists() {
+        println!("FAIL (socket {} does not exist)", socket_path.display());
+        all_ok = false;
+    } else {
+        match api.get_json::<serde_json::Value>("/version").await {
+            Ok(v) => {
+                let ver = v["Version"].as_str().unwrap_or("unknown");
+                let api_ver = v["ApiVersion"].as_str().unwrap_or("unknown");
+                println!("OK (version {ver}, API {api_ver})");
+            }
+            Err(e) => {
+                println!("FAIL ({e})");
+                all_ok = false;
+            }
+        }
+    }
+
+    // 2. cgroup v2
+    print!("  [..] cgroup v2 support: ");
+    let cgroups = std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers");
+    match cgroups {
+        Ok(controllers) if !controllers.trim().is_empty() => {
+            println!("OK (controllers: {})", controllers.trim());
+        }
+        _ => {
+            println!("FAIL (cgroup v2 controllers missing from /sys/fs/cgroup)");
+            all_ok = false;
+        }
+    }
+
+    // 3. overlayfs
+    print!("  [..] overlayfs kernel module: ");
+    let filesystems = std::fs::read_to_string("/proc/filesystems").unwrap_or_default();
+    if filesystems.contains("overlay") {
+        println!("OK");
+    } else {
+        println!("FAIL (overlay filesystem not supported by kernel)");
+        all_ok = false;
+    }
+
+    // 4. ip binary
+    print!("  [..] iproute2 (`ip`): ");
+    match std::process::Command::new("ip").arg("-V").output() {
+        Ok(out) if out.status.success() => {
+            println!("OK ({})", String::from_utf8_lossy(&out.stdout).trim());
+        }
+        _ => {
+            println!("FAIL (`ip` binary not found or failed)");
+            all_ok = false;
+        }
+    }
+
+    // 5. iptables binary
+    print!("  [..] iptables: ");
+    match std::process::Command::new("iptables").arg("-V").output() {
+        Ok(out) if out.status.success() => {
+            println!("OK ({})", String::from_utf8_lossy(&out.stdout).trim());
+        }
+        _ => {
+            println!("FAIL (`iptables` binary not found or failed)");
+            all_ok = false;
+        }
+    }
+
+    // 6. data paths
+    print!("  [..] data paths: ");
+    let info = api.get_json::<serde_json::Value>("/info").await;
+    match info {
+        Ok(inf) => {
+            let root_dir = inf["DockerRootDir"].as_str().unwrap_or("/var/lib/ingot");
+            let p = std::path::Path::new(root_dir);
+            if p.exists() {
+                println!("OK ({})", root_dir);
+            } else {
+                println!("WARN (daemon root {} does not exist yet)", root_dir);
+            }
+
+            // 7. seccomp
+            print!("  [..] seccomp profile: ");
+            let sec_opts = inf["SecurityOptions"].as_array();
+            let has_seccomp = sec_opts.is_some_and(|opts| {
+                opts.iter()
+                    .any(|o| o.as_str().is_some_and(|s| s.contains("seccomp")))
+            });
+            if has_seccomp {
+                println!("OK (default profile active)");
+            } else {
+                println!("WARN (seccomp profile not reported)");
+            }
+        }
+        Err(_) => {
+            println!("SKIP (daemon not reachable)");
+        }
+    }
+
+    println!();
+    if all_ok {
+        println!("All critical preflight checks passed.");
+        Ok(())
+    } else {
+        Err(anyhow!("One or more preflight checks failed"))
+    }
 }

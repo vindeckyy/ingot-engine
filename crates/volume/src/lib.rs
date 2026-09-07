@@ -29,8 +29,9 @@ impl VolumeManager {
         Ok(Self { paths })
     }
 
-    pub fn volume_dir(&self, name: &str) -> PathBuf {
-        self.paths.volumes().join(name)
+    pub fn volume_dir(&self, name: &str) -> Result<PathBuf> {
+        ingot_util::validate_resource_name(name)?;
+        Ok(self.paths.volumes().join(name))
     }
 
     pub fn create(
@@ -41,11 +42,15 @@ impl VolumeManager {
         options: HashMap<String, String>,
     ) -> Result<Volume> {
         let name = match name {
-            Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+            Some(n) if !n.trim().is_empty() => {
+                let trimmed = n.trim();
+                ingot_util::validate_resource_name(trimmed)?;
+                trimmed.to_string()
+            }
             _ => ingot_util::new_id()[..32].to_string(),
         };
 
-        let dir = self.volume_dir(&name);
+        let dir = self.volume_dir(&name)?;
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create volume dir at {}", dir.display()))?;
 
@@ -58,22 +63,25 @@ impl VolumeManager {
         };
 
         let meta_path = dir.join("metadata.json");
-        let _ = ingot_store::write_json_atomic(&meta_path, &meta);
+        ingot_store::write_json_atomic(&meta_path, &meta)?;
 
         Ok(self.to_volume(&meta, &dir))
     }
 
     pub fn get(&self, name: &str) -> Result<Option<Volume>> {
-        let dir = self.volume_dir(name);
+        ingot_util::validate_resource_name(name)?;
+        let dir = self.volume_dir(name)?;
         if !dir.is_dir() {
             return Ok(None);
         }
         let meta_path = dir.join("metadata.json");
-        let meta = if let Ok(data) = std::fs::read(&meta_path) {
-            serde_json::from_slice(&data).unwrap_or_else(|_| self.default_meta(name))
-        } else {
-            self.default_meta(name)
-        };
+        if !meta_path.exists() {
+            return Ok(None);
+        }
+        let data = std::fs::read(&meta_path)
+            .with_context(|| format!("read volume metadata {}", meta_path.display()))?;
+        let meta: VolumeMeta = serde_json::from_slice(&data)
+            .with_context(|| format!("corrupt volume metadata in {}", meta_path.display()))?;
         Ok(Some(self.to_volume(&meta, &dir)))
     }
 
@@ -96,7 +104,8 @@ impl VolumeManager {
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
-        let dir = self.volume_dir(name);
+        ingot_util::validate_resource_name(name)?;
+        let dir = self.volume_dir(name)?;
         if !dir.is_dir() {
             return Err(anyhow!("no such volume: {name}"));
         }
@@ -138,16 +147,6 @@ impl VolumeManager {
             }
         }
         Ok(removed)
-    }
-
-    fn default_meta(&self, name: &str) -> VolumeMeta {
-        VolumeMeta {
-            name: name.to_string(),
-            created_at: ingot_util::now_rfc3339(),
-            driver: "local".into(),
-            labels: HashMap::new(),
-            options: HashMap::new(),
-        }
     }
 
     fn to_volume(&self, meta: &VolumeMeta, dir: &Path) -> Volume {
@@ -231,5 +230,46 @@ mod tests {
         let vm = VolumeManager::new(paths).unwrap();
         let removed = vm.prune(&[], None, &HashMap::new()).unwrap();
         assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn volume_name_validation() {
+        let paths = tmp_paths("name-val");
+        let vm = VolumeManager::new(paths).unwrap();
+
+        // Path separators and traversal are rejected
+        assert!(vm
+            .create(Some("foo/bar"), None, HashMap::new(), HashMap::new())
+            .is_err());
+        assert!(vm
+            .create(Some("../foo"), None, HashMap::new(), HashMap::new())
+            .is_err());
+        assert!(vm
+            .create(Some(".."), None, HashMap::new(), HashMap::new())
+            .is_err());
+        assert!(vm
+            .create(Some("."), None, HashMap::new(), HashMap::new())
+            .is_err());
+        assert!(vm
+            .create(Some("foo\\bar"), None, HashMap::new(), HashMap::new())
+            .is_err());
+        assert!(vm.get("foo/bar").is_err());
+        assert!(vm.get("../foo").is_err());
+        assert!(vm.remove("foo/bar").is_err());
+        assert!(vm.remove("../foo").is_err());
+    }
+
+    #[test]
+    fn corrupt_metadata_returns_error() {
+        let paths = tmp_paths("corrupt");
+        let vm = VolumeManager::new(paths).unwrap();
+        let vol = vm
+            .create(Some("valid-vol"), None, HashMap::new(), HashMap::new())
+            .unwrap();
+        let meta_path = PathBuf::from(vol.Mountpoint).join("metadata.json");
+        std::fs::write(&meta_path, "not valid json").unwrap();
+
+        // Getting a corrupt volume returns an error, does not invent new creation time
+        assert!(vm.get("valid-vol").is_err());
     }
 }

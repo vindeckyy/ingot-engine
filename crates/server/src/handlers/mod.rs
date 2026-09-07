@@ -54,6 +54,40 @@ pub async fn not_implemented_fallback(req: axum::http::Request<axum::body::Body>
     )
 }
 
+/// Stream request body into a temporary file while enforcing max_bytes limit.
+pub async fn stream_body_to_temp_file(
+    body: axum::body::Body,
+    max_bytes: u64,
+) -> Result<tempfile::NamedTempFile, Response> {
+    use futures::StreamExt;
+    use std::io::Write;
+
+    let mut named_temp = tempfile::NamedTempFile::new()
+        .map_err(|e| server_error(format!("create temp file: {e}")))?;
+    let mut total_bytes: u64 = 0;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => return Err(bad_request(format!("read request body: {e}"))),
+        };
+        total_bytes = total_bytes.saturating_add(chunk.len() as u64);
+        if total_bytes > max_bytes {
+            return Err(docker_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("request body exceeded size limit of {max_bytes} bytes"),
+            ));
+        }
+        if let Err(e) = named_temp.write_all(&chunk) {
+            return Err(server_error(format!("write temp file: {e}")));
+        }
+    }
+    if let Err(e) = named_temp.flush() {
+        return Err(server_error(format!("flush temp file: {e}")));
+    }
+    Ok(named_temp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

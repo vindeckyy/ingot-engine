@@ -101,6 +101,27 @@ pub async fn create(State(state): State<SharedState>, body: axum::body::Bytes) -
         Ok(b) => b,
         Err(e) => return bad_request(format!("invalid network config: {e}")),
     };
+    if body.EnableIPv6 {
+        return bad_request("IPv6 networks are not supported");
+    }
+    if body.Ingress {
+        return bad_request("ingress networks are not supported");
+    }
+    if !body.Driver.is_empty() && body.Driver != "bridge" {
+        return bad_request(format!(
+            "unsupported network driver {:?}; only bridge is supported",
+            body.Driver
+        ));
+    }
+    if !body.IPAM.Driver.is_empty() && body.IPAM.Driver != "default" {
+        return bad_request(format!(
+            "unsupported IPAM driver {:?}; only default is supported",
+            body.IPAM.Driver
+        ));
+    }
+    if body.IPAM.Options.as_ref().is_some_and(|o| !o.is_empty()) {
+        return bad_request("IPAM options are not supported");
+    }
     let subnet = body.IPAM.Config.as_ref().and_then(|c| {
         c.first().and_then(|x| {
             if x.Subnet.is_empty() {
@@ -131,11 +152,14 @@ pub async fn create(State(state): State<SharedState>, body: axum::body::Bytes) -
         )
         .await
     {
-        Ok(rec) => axum::Json(NetworkCreateResponse {
-            Id: rec.id,
-            Warning: String::new(),
-        })
-        .into_response(),
+        Ok(rec) => (
+            StatusCode::CREATED,
+            axum::Json(NetworkCreateResponse {
+                Id: rec.id,
+                Warning: String::new(),
+            }),
+        )
+            .into_response(),
         // Validation failures are client errors (400); name/subnet
         // conflicts are 409. create_network phrases validation as
         // "invalid ..." by convention.

@@ -1,0 +1,37 @@
+[workspace]
+
+[package]
+name = "ingot-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ingot-builder = { path = "../crates/builder" }
+ingot-registry = { path = "../crates/registry" }
+ingot-image = { path = "../crates/image" }
+ingot-util = { path = "../crates/util" }
+tar = "0.4"
+tempfile = "3"
+
+[[bin]]
+name = "fuzz_dockerfile"
+path = "fuzz_targets/fuzz_dockerfile.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_registry_ref"
+path = "fuzz_targets/fuzz_registry_ref.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_archive_unpack"
+path = "fuzz_targets/fuzz_archive_unpack.rs"
+test = false
+doc = false

@@ -43,8 +43,16 @@ fn api_routes() -> Router<SharedState> {
             "/containers/{id}/attach",
             post(handlers::attach_exec::attach),
         )
-        .route("/build", post(handlers::build::build))
-        .route("/secrets", post(handlers::secrets::create))
+        .route(
+            "/build",
+            post(handlers::build::build)
+                .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route(
+            "/secrets",
+            post(handlers::secrets::create)
+                .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
+        )
         .route(
             "/containers/{id}/exec",
             post(handlers::attach_exec::exec_create),
@@ -56,7 +64,10 @@ fn api_routes() -> Router<SharedState> {
             "/containers/{id}/archive",
             get(handlers::containers::archive_get)
                 .head(handlers::containers::archive_head)
-                .put(handlers::containers::archive_put),
+                .put(handlers::containers::archive_put)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    10 * 1024 * 1024 * 1024,
+                )),
         )
         .route("/containers/{id}", delete(handlers::containers::remove))
         // images (M1, M7)
@@ -65,7 +76,12 @@ fn api_routes() -> Router<SharedState> {
         .route("/images/prune", post(handlers::images::prune))
         .route("/images/get", get(handlers::images::get_tar))
         .route("/images/{name}/get", get(handlers::images::get_tar_single))
-        .route("/images/load", post(handlers::images::load_tar))
+        .route(
+            "/images/load",
+            post(handlers::images::load_tar).layer(axum::extract::DefaultBodyLimit::max(
+                10 * 1024 * 1024 * 1024,
+            )),
+        )
         .route("/images/{name}/json", get(handlers::images::inspect))
         .route("/images/{name}/history", get(handlers::images::history))
         .route("/images/{name}/tag", post(handlers::images::tag))
@@ -97,13 +113,10 @@ fn api_routes() -> Router<SharedState> {
 }
 
 pub fn build_router(state: SharedState) -> Router {
-    let mut router = Router::new().merge(api_routes());
-    for minor in 24..=44 {
-        let prefix = format!("/v1.{}", minor);
-        router = router.nest(&prefix, api_routes());
-    }
-    router
-        .layer(axum::extract::DefaultBodyLimit::disable())
+    Router::new()
+        .merge(api_routes())
+        .nest("/v1.44", api_routes())
+        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(axum::middleware::from_fn(trace_requests))
         .fallback(handlers::not_implemented_fallback)
         .with_state(state)
@@ -170,23 +183,20 @@ mod tests {
         (status, json, text)
     }
 
-    /// Plan Phase 1, unit 1.6: every advertised `/v1.24`–`/v1.44` prefix
-    /// routes the core surface identically to the bare paths.
     #[tokio::test]
     async fn version_prefix_parity() {
         let state = test_state("prefix");
-        for minor in 24..=44 {
-            let router = build_router(state.clone());
-            let (s, _, text) = get(router, &format!("/v1.{minor}/_ping")).await;
-            assert_eq!(s, StatusCode::OK, "ping on v1.{minor}");
-            assert_eq!(text, "OK");
+        let router = build_router(state.clone());
+        let (s, _, text) = get(router, "/v1.44/_ping").await;
+        assert_eq!(s, StatusCode::OK, "ping on v1.44");
+        assert_eq!(text, "OK");
 
-            let router = build_router(state.clone());
-            let (s, v, _) = get(router, &format!("/v1.{minor}/version")).await;
-            assert_eq!(s, StatusCode::OK, "version on v1.{minor}");
-            assert_eq!(v["ApiVersion"], ingot_api::API_VERSION);
-            assert_eq!(v["MinAPIVersion"], ingot_api::MIN_API_VERSION);
-        }
+        let router = build_router(state.clone());
+        let (s, v, _) = get(router, "/v1.44/version").await;
+        assert_eq!(s, StatusCode::OK, "version on v1.44");
+        assert_eq!(v["ApiVersion"], ingot_api::API_VERSION);
+        assert_eq!(v["MinAPIVersion"], ingot_api::MIN_API_VERSION);
+
         // Bare paths keep working too.
         let (s, _, text) = get(build_router(state.clone()), "/_ping").await;
         assert_eq!(s, StatusCode::OK);
@@ -196,7 +206,12 @@ mod tests {
     #[tokio::test]
     async fn unknown_routes_are_explicit_501() {
         let state = test_state("fallback");
-        for uri in ["/v1.44/plugins/list", "/v1.30/swarm/xxx", "/nope"] {
+        for uri in [
+            "/v1.44/plugins/list",
+            "/v1.30/swarm/xxx",
+            "/nope",
+            "/v1.24/version",
+        ] {
             let (s, v, _) = get(build_router(state.clone()), uri).await;
             assert_eq!(s, StatusCode::NOT_IMPLEMENTED, "{uri}");
             assert!(

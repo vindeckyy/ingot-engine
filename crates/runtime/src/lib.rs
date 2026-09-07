@@ -7,6 +7,7 @@ pub mod exec;
 pub mod manager;
 pub mod overlay;
 pub mod record;
+pub mod seccomp;
 pub mod stdio;
 pub mod step;
 

@@ -267,9 +267,15 @@ pub async fn up(
             "com.docker.compose.network": "default"
         }
     });
-    let _ = api
+    if let Err(e) = api
         .post::<serde_json::Value>("/networks/create", Some(net_body))
-        .await;
+        .await
+    {
+        let msg = format!("{e:#}");
+        if !msg.contains("Conflict") && !msg.contains("already exists") {
+            return Err(anyhow!("failed to create network {net_name}: {e}"));
+        }
+    }
 
     // 2. Create named volumes declared in compose
     for vname in compose.volumes.keys() {
@@ -282,9 +288,15 @@ pub async fn up(
                 "com.docker.compose.volume": vname
             }
         });
-        let _ = api
+        if let Err(e) = api
             .post::<serde_json::Value>("/volumes/create", Some(vol_body))
-            .await;
+            .await
+        {
+            let msg = format!("{e:#}");
+            if !msg.contains("Conflict") && !msg.contains("already exists") {
+                return Err(anyhow!("failed to create volume {full_vname}: {e}"));
+            }
+        }
     }
 
     // 3. Dependency order
@@ -476,30 +488,41 @@ pub async fn down(
             {
                 let id = c["Id"].as_str().unwrap_or_default();
                 let name = c["Names"][0].as_str().unwrap_or(id).trim_start_matches('/');
-                let _ = api
+                let stop_res = api
                     .request_raw("POST", &format!("/containers/{id}/stop?t=2"), None)
                     .await;
-                let _ = api
+                if stop_res.is_ok() {
+                    println!(" ✔ Container {name}  Stopped");
+                }
+                let del_res = api
                     .request_raw("DELETE", &format!("/containers/{id}?force=1"), None)
                     .await;
-                println!(" ✔ Container {name}  Removed");
+                if del_res.is_ok() {
+                    println!(" ✔ Container {name}  Removed");
+                } else if let Err(e) = del_res {
+                    eprintln!(" ✖ Container {name}  Remove failed: {e}");
+                }
             }
         }
     }
 
     let net_name = format!("{project}_default");
-    let _ = api
+    let net_del = api
         .request_raw("DELETE", &format!("/networks/{net_name}"), None)
         .await;
-    println!(" ✔ Network {net_name}  Removed");
+    if net_del.is_ok() {
+        println!(" ✔ Network {net_name}  Removed");
+    }
 
     if remove_volumes {
         for vname in compose.volumes.keys() {
             let full_vname = format!("{project}_{vname}");
-            let _ = api
+            let vol_del = api
                 .request_raw("DELETE", &format!("/volumes/{full_vname}"), None)
                 .await;
-            println!(" ✔ Volume {full_vname}  Removed");
+            if vol_del.is_ok() {
+                println!(" ✔ Volume {full_vname}  Removed");
+            }
         }
     }
 

@@ -1,17 +1,32 @@
 #!/usr/bin/env bash
 # Install Ingot from source.
-#   ./scripts/install.sh            — release build, install to /usr/local
-#   ./scripts/install.sh --prefix=/opt/ingot
-#   ./scripts/install.sh --debug    — debug build
+#   ./scripts/install.sh                       — release build, install to /usr/local/bin
+#   ./scripts/install.sh --prefix=/opt/ingot   — install to /opt/ingot/bin
+#   ./scripts/install.sh --destdir=/tmp/stage  — stage files under /tmp/stage
+#   ./scripts/install.sh --service             — also install systemd service (requires root)
+#   ./scripts/install.sh --debug               — build and install debug binaries
 set -euo pipefail
 
-PREFIX="/usr/local"
+PREFIX="${PREFIX:-/usr/local}"
+DESTDIR="${DESTDIR:-}"
 DEBUG=0
+INSTALL_SERVICE=0
 
 for arg in "$@"; do
     case "$arg" in
-        --prefix=*) PREFIX="${arg#--prefix=}" ;;
-        --debug)    DEBUG=1 ;;
+        --prefix=*)   PREFIX="${arg#--prefix=}" ;;
+        --destdir=*)  DESTDIR="${arg#--destdir=}" ;;
+        --service)    INSTALL_SERVICE=1 ;;
+        --debug)      DEBUG=1 ;;
+        -h|--help)
+            echo "Usage: $0 [OPTIONS]"
+            echo "Options:"
+            echo "  --prefix=DIR     Installation prefix (default: /usr/local)"
+            echo "  --destdir=DIR    Staging directory prepended to install paths (default: empty)"
+            echo "  --service        Install systemd service unit into /etc/systemd/system (requires root)"
+            echo "  --debug          Build and install unoptimized debug binaries"
+            exit 0
+            ;;
         *) echo "unknown option: $arg"; exit 1 ;;
     esac
 done
@@ -25,43 +40,54 @@ if [ "$DEBUG" = 1 ]; then
     BUILD_FLAGS=""
 fi
 
+TARGET_INGOT="target/$PROFILE/ingot"
+TARGET_INGOTD="target/$PROFILE/ingotd"
+
 echo "==> Building ingotd and ingot ($PROFILE)"
 cargo build $BUILD_FLAGS -p ingotd -p ingot-cli
 
-echo "==> Installing to $PREFIX/bin"
-install -d "$PREFIX/bin"
-install -m 0755 "target/$PROFILE/ingotd" "$PREFIX/bin/ingotd"
-install -m 0755 "target/$PROFILE/ingot"  "$PREFIX/bin/ingot"
+BINDIR="$DESTDIR$PREFIX/bin"
+echo "==> Installing binaries to $BINDIR"
+install -d "$BINDIR"
+install -m 0755 "$TARGET_INGOTD" "$BINDIR/ingotd"
+install -m 0755 "$TARGET_INGOT"  "$BINDIR/ingot"
 
-echo "==> Installing systemd unit"
-install -d /etc/systemd/system 2>/dev/null || true
-if [ -d /etc/systemd/system ]; then
-    install -m 0644 scripts/ingotd.service /etc/systemd/system/ingotd.service
-    echo "    Installed. Enable with: sudo systemctl enable --now ingotd"
+echo "==> Installing shell completions using built ingot binary"
+BASH_COMP_DIR="$DESTDIR$PREFIX/share/bash-completion/completions"
+ZSH_COMP_DIR="$DESTDIR$PREFIX/share/zsh/site-functions"
+FISH_COMP_DIR="$DESTDIR$PREFIX/share/fish/completions"
+
+install -d "$BASH_COMP_DIR" "$ZSH_COMP_DIR" "$FISH_COMP_DIR" 2>/dev/null || true
+if [ -d "$BASH_COMP_DIR" ]; then
+    "$TARGET_INGOT" completions bash > "$BASH_COMP_DIR/ingot" 2>/dev/null || true
+fi
+if [ -d "$ZSH_COMP_DIR" ]; then
+    "$TARGET_INGOT" completions zsh > "$ZSH_COMP_DIR/_ingot" 2>/dev/null || true
+fi
+if [ -d "$FISH_COMP_DIR" ]; then
+    "$TARGET_INGOT" completions fish > "$FISH_COMP_DIR/ingot.fish" 2>/dev/null || true
 fi
 
-echo "==> Installing shell completions"
-install -d "$PREFIX/share/bash-completion/completions" 2>/dev/null || true
-install -d "$PREFIX/share/zsh/site-functions"          2>/dev/null || true
-install -d "$PREFIX/share/fish/completions"            2>/dev/null || true
-if [ -d "$PREFIX/share/bash-completion/completions" ]; then
-    ingot completions bash > "$PREFIX/share/bash-completion/completions/ingot" 2>/dev/null || true
-fi
-if [ -d "$PREFIX/share/zsh/site-functions" ]; then
-    ingot completions zsh > "$PREFIX/share/zsh/site-functions/_ingot" 2>/dev/null || true
-fi
-if [ -d "$PREFIX/share/fish/completions" ]; then
-    ingot completions fish > "$PREFIX/share/fish/completions/ingot.fish" 2>/dev/null || true
+if [ "$INSTALL_SERVICE" = 1 ]; then
+    SYSTEMD_DIR="$DESTDIR/etc/systemd/system"
+    echo "==> Installing systemd unit to $SYSTEMD_DIR"
+    install -d "$SYSTEMD_DIR"
+    # Adjust ExecStart in service file to match PREFIX
+    sed "s|ExecStart=/usr/local/bin/ingotd|ExecStart=$PREFIX/bin/ingotd|" scripts/ingotd.service > "$SYSTEMD_DIR/ingotd.service"
+    chmod 0644 "$SYSTEMD_DIR/ingotd.service"
+    echo "    Systemd unit installed. Enable with: sudo systemctl enable --now ingotd"
 fi
 
 echo
-echo "Ingot installed:"
+echo "Ingot installed successfully:"
 echo "  Daemon:  $PREFIX/bin/ingotd"
 echo "  CLI:     $PREFIX/bin/ingot"
 echo
-echo "Start the daemon:"
-echo "  sudo ingotd"
+echo "To run the daemon (root required for container namespaces/cgroups/mounts):"
+echo "  sudo $PREFIX/bin/ingotd"
 echo
-echo "Use the Docker CLI against it:"
+echo "To use the companion CLI or Docker CLI:"
 echo "  export DOCKER_HOST=unix:///run/ingot/ingot.sock"
+echo "  $PREFIX/bin/ingot doctor"
 echo "  docker version"
+

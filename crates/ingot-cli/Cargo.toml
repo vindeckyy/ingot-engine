@@ -30,3 +30,4 @@ chrono.workspace = true
 futures.workspace = true
 ingot-api.workspace = true
 ingot-util.workspace = true
+ingot-registry.workspace = true

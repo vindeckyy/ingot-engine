@@ -51,6 +51,8 @@ pub struct MountRecord {
     pub source: String,
     pub destination: String,
     pub read_only: bool,
+    #[serde(default)]
+    pub is_anonymous: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

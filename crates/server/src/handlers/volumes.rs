@@ -142,21 +142,33 @@ pub async fn create(State(state): State<SharedState>, body: axum::body::Bytes) -
     let name = if body.Name.is_empty() {
         None
     } else {
+        if let Err(e) = ingot_util::validate_resource_name(&body.Name) {
+            return bad_request(format!("invalid volume name {:?}: {e}", body.Name));
+        }
         Some(body.Name.as_str())
     };
     let driver = if body.Driver.is_empty() {
         None
     } else {
+        if body.Driver != "local" {
+            return bad_request(format!(
+                "volume driver {:?} is not supported (only 'local' is supported)",
+                body.Driver
+            ));
+        }
         Some(body.Driver.as_str())
     };
     match vm.create(name, driver, body.Labels, body.DriverOpts) {
-        Ok(vol) => axum::Json(vol).into_response(),
-        Err(e) => server_error(format!("create volume: {e}")),
+        Ok(vol) => (StatusCode::CREATED, axum::Json(vol)).into_response(),
+        Err(e) => bad_request(format!("create volume: {e}")),
     }
 }
 
 /// GET /volumes/{name}
 pub async fn inspect(State(state): State<SharedState>, Path(name): Path<String>) -> Response {
+    if let Err(e) = ingot_util::validate_resource_name(&name) {
+        return bad_request(format!("invalid volume name {name:?}: {e}"));
+    }
     let vm = get_vm(&state);
     match vm.get(&name) {
         Ok(Some(vol)) => axum::Json(vol).into_response(),
@@ -167,6 +179,9 @@ pub async fn inspect(State(state): State<SharedState>, Path(name): Path<String>)
 
 /// DELETE /volumes/{name}
 pub async fn remove(State(state): State<SharedState>, Path(name): Path<String>) -> Response {
+    if let Err(e) = ingot_util::validate_resource_name(&name) {
+        return bad_request(format!("invalid volume name {name:?}: {e}"));
+    }
     let vm = get_vm(&state);
     match vm.remove(&name) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),

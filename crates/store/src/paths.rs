@@ -174,9 +174,6 @@ impl DataPaths {
     pub fn netns_bind(&self, id: &str) -> PathBuf {
         self.netns().join(id)
     }
-    pub fn pid_file(&self) -> PathBuf {
-        self.run_root.join("ingotd.pid")
-    }
 
     /// Create the whole directory skeleton. Daemon boot does this.
     pub fn create_all(&self) -> Result<()> {

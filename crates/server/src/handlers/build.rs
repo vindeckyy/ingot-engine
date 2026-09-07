@@ -56,6 +56,7 @@ const MAX_CONTEXT_FILES: u64 = 100_000;
 /// Unpack a context tarball (optionally gzipped) into `dest`, enforcing
 /// traversal, link, size, and file-count limits. Fails closed: any
 /// violation aborts the whole extraction with the destination removed.
+#[allow(dead_code)]
 fn unpack_context(bytes: &[u8], dest: &std::path::Path) -> Result<(u64, u64), anyhow::Error> {
     if bytes.len() as u64 > MAX_CONTEXT_UPLOAD_BYTES {
         anyhow::bail!(
@@ -71,6 +72,24 @@ fn unpack_context(bytes: &[u8], dest: &std::path::Path) -> Result<(u64, u64), an
         extract_entries(tar::Archive::new(gz), dest)
     } else {
         extract_entries(tar::Archive::new(bytes), dest)
+    }
+}
+
+fn unpack_context_file(
+    file: std::fs::File,
+    dest: &std::path::Path,
+) -> Result<(u64, u64), anyhow::Error> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut reader = std::io::BufReader::new(file);
+    let mut magic = [0u8; 2];
+    let n = reader.read(&mut magic)?;
+    reader.seek(SeekFrom::Start(0))?;
+    std::fs::create_dir_all(dest)?;
+    if n >= 2 && magic == [0x1f, 0x8b] {
+        let gz = flate2::read::GzDecoder::new(reader);
+        extract_entries(tar::Archive::new(gz), dest)
+    } else {
+        extract_entries(tar::Archive::new(reader), dest)
     }
 }
 
@@ -206,7 +225,7 @@ pub async fn build(
     State(state): State<SharedState>,
     Query(q): Query<BuildQuery>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressMessage>(64);
     let build_id = ingot_util::new_id()[..16].to_string();
@@ -218,11 +237,20 @@ pub async fn build(
         Err(e) => return crate::handlers::bad_request(e),
     };
 
+    let temp_file =
+        match crate::handlers::stream_body_to_temp_file(body, MAX_CONTEXT_UPLOAD_BYTES).await {
+            Ok(f) => f,
+            Err(resp) => return resp,
+        };
+    let file = match temp_file.reopen() {
+        Ok(f) => f,
+        Err(e) => return crate::handlers::server_error(format!("failed to reopen temp file: {e}")),
+    };
+
     // Extract the uploaded tar context on a blocking thread.
     let ctx_dir = context_dir.clone();
-    let bytes = body.clone();
     let extract = tokio::task::spawn_blocking(move || -> Result<(u64, u64), anyhow::Error> {
-        unpack_context(&bytes, &ctx_dir).inspect_err(|_| {
+        unpack_context_file(file, &ctx_dir).inspect_err(|_| {
             let _ = std::fs::remove_dir_all(&ctx_dir);
         })
     })

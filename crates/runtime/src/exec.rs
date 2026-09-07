@@ -6,7 +6,7 @@
 
 use crate::manager::ContainerHandle;
 use crate::stdio::{pump_pipe, StdioHub, STREAM_STDERR, STREAM_STDOUT};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
@@ -99,13 +99,23 @@ pub fn start_exec(
     handle: Arc<ContainerHandle>,
     paths: ingot_store::paths::DataPaths,
 ) -> Result<()> {
-    let container_pid = {
+    let (container_pid, container_id) = {
         let st = handle.state.lock().unwrap();
         if st.status != crate::record::StateStatus::Running {
             return Err(anyhow!("container is not running"));
         }
-        st.pid
+        (st.pid, handle.id())
     };
+
+    // Verify cgroup identity to defend against PID reuse
+    let cgroup_path = format!("/proc/{container_pid}/cgroup");
+    let cgroup_content = std::fs::read_to_string(&cgroup_path)
+        .with_context(|| format!("failed to read {cgroup_path}"))?;
+    if !cgroup_content.contains(&container_id) {
+        return Err(anyhow!(
+            "exec target pid {container_pid} cgroup does not match container {container_id}"
+        ));
+    }
 
     // Open the container's namespace fds while it is alive.
     let ns = |name: &str| -> Result<std::fs::File> {
@@ -147,15 +157,33 @@ pub fn start_exec(
     let (uid, gid) = parse_user(&session.user, &handle);
     // Exec sessions run with the container's capability set and resource
     // limits, not the daemon's (Plan Phase 3, units 3.1/3.4).
-    let (exec_cap_add, exec_cap_drop, exec_privileged, exec_ulimits) = {
+    let (exec_cap_add, exec_cap_drop, exec_privileged, exec_ulimits, exec_seccomp) = {
         let rec = handle.record.lock().unwrap();
+        let seccomp = !rec.hostconfig.Privileged
+            && !rec
+                .hostconfig
+                .SecurityOpt
+                .iter()
+                .any(|s| s == "seccomp=unconfined" || s == "seccomp:unconfined");
         (
             rec.hostconfig.CapAdd.clone(),
             rec.hostconfig.CapDrop.clone(),
             rec.hostconfig.Privileged,
             crate::error::parse_ulimits(&rec.hostconfig)
                 .map_err(|e| anyhow!("invalid ulimits: {e}"))?,
+            seccomp,
         )
+    };
+
+    if exec_seccomp && !exec_privileged {
+        let _ = crate::seccomp::get_default_bpf_program();
+    }
+
+    let cg_fd = unsafe {
+        let cg_path = std::ffi::CString::new(format!(
+            "/sys/fs/cgroup/ingot.slice/{container_id}/cgroup.procs"
+        ))?;
+        libc::open(cg_path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC)
     };
     // Pin the container's root before forking: after setns into the mount
     // namespace `/` may resolve to a stale pre-pivot tree.
@@ -221,6 +249,7 @@ pub fn start_exec(
     let cap_add = exec_cap_add;
     let cap_drop = exec_cap_drop;
     let privileged = exec_privileged;
+    let seccomp = exec_seccomp;
     let ulimits_for_exec = exec_ulimits;
     let argv_for_exec = argv;
     let envp_for_exec = envp;
@@ -260,6 +289,10 @@ pub fn start_exec(
             let pid2 = libc::fork();
             if pid2 == 0 {
                 // child2: actual exec
+                if cg_fd >= 0 {
+                    libc::write(cg_fd, b"0\n".as_ptr() as *const libc::c_void, 2);
+                    libc::close(cg_fd);
+                }
                 let nsjoin = |fd: i32, nstype: i32, what: &str| {
                     if libc::setns(fd, nstype) != 0 {
                         let e = std::io::Error::last_os_error();
@@ -331,9 +364,18 @@ pub fn start_exec(
                 // Mirror container init (child.rs step 9): a non-privileged
                 // exec must not regain dropped caps (or anything else) at
                 // the execve below. NO_NEW_PRIVS is inherited and one-way.
-                if !privileged && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                    report(b"exec: setting NO_NEW_PRIVS failed\n");
-                    libc::_exit(126);
+                if !privileged {
+                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                        report(b"exec: setting NO_NEW_PRIVS failed\n");
+                        libc::_exit(126);
+                    }
+                    if seccomp {
+                        if let Err(e) = crate::seccomp::apply_default_seccomp() {
+                            let msg = format!("exec: apply seccomp failed: {e}\n").into_bytes();
+                            report(&msg);
+                            libc::_exit(126);
+                        }
+                    }
                 }
                 if libc::chdir(wd.as_ptr()) != 0 {
                     // workdir may be missing; fall back to /
@@ -381,6 +423,9 @@ pub fn start_exec(
                     126
                 });
             } else if pid2 > 0 {
+                if cg_fd >= 0 {
+                    libc::close(cg_fd);
+                }
                 // child1: wait for child2, mirror its exit status.
                 let mut status = 0;
                 libc::waitpid(pid2, &mut status, 0);
@@ -391,8 +436,14 @@ pub fn start_exec(
                 };
                 libc::_exit(code);
             } else {
+                if cg_fd >= 0 {
+                    libc::close(cg_fd);
+                }
                 libc::_exit(126);
             }
+        }
+        if cg_fd >= 0 {
+            libc::close(cg_fd);
         }
         if pid1 < 0 {
             return Err(anyhow!("fork failed: {}", std::io::Error::last_os_error()));

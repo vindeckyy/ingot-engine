@@ -12,6 +12,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 pub fn default_socket() -> PathBuf {
@@ -219,18 +220,217 @@ pub async fn stream_lines(
     resp: Response<Incoming>,
     mut on_line: impl FnMut(&serde_json::Value),
 ) -> Result<()> {
+    let status = resp.status();
     let mut body = resp.into_body();
+    if !status.is_success() {
+        let bytes = body.collect().await?.to_bytes();
+        return Err(parse_error_body(status.as_u16(), &bytes));
+    }
+    let mut buffer = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame?;
-        let data = frame.data_ref().map(|b| b.as_ref()).unwrap_or(&[]);
-        for line in String::from_utf8_lossy(data).lines() {
-            if line.trim().is_empty() {
-                continue;
+        if let Some(data) = frame.data_ref() {
+            buffer.extend_from_slice(data.as_ref());
+            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        on_line(&v);
+                    }
+                }
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+        }
+    }
+    if !buffer.is_empty() {
+        let line = String::from_utf8_lossy(&buffer);
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
                 on_line(&v);
             }
         }
+    }
+    Ok(())
+}
+
+pub struct UpgradedConnection {
+    pub stream: UnixStream,
+    pub leftover: Vec<u8>,
+}
+
+impl ApiClient {
+    pub async fn upgrade_stream(
+        &self,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<UpgradedConnection> {
+        let mut stream = UnixStream::connect(&self.socket)
+            .await
+            .with_context(|| format!("connect to {}", self.socket.display()))?;
+        let body_bytes = body.unwrap_or_default();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: ingot\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: tcp\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             \r\n",
+            body_bytes.len()
+        );
+        stream.write_all(req.as_bytes()).await?;
+        if !body_bytes.is_empty() {
+            stream.write_all(&body_bytes).await?;
+        }
+
+        let mut buf = Vec::new();
+        let mut temp = [0u8; 1024];
+        let header_end;
+        loop {
+            let n = stream.read(&mut temp).await?;
+            if n == 0 {
+                return Err(anyhow!("server closed connection during upgrade handshake"));
+            }
+            buf.extend_from_slice(&temp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+
+        let header_bytes = &buf[..header_end];
+        let header_str = String::from_utf8_lossy(header_bytes);
+        let status_line = header_str.lines().next().unwrap_or("");
+        if !status_line.contains("101") {
+            let rest = &buf[header_end..];
+            return Err(anyhow!(
+                "upgrade request failed: {} - {}",
+                status_line,
+                String::from_utf8_lossy(rest)
+            ));
+        }
+
+        let leftover = buf[header_end..].to_vec();
+        Ok(UpgradedConnection { stream, leftover })
+    }
+}
+
+struct RawModeGuard {
+    orig: libc::termios,
+    fd: i32,
+    active: bool,
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
+            }
+        }
+    }
+}
+
+fn set_raw_mode() -> Option<RawModeGuard> {
+    let fd = 0; // stdin
+    unsafe {
+        if libc::isatty(fd) == 0 {
+            return None;
+        }
+        let mut orig = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut orig) != 0 {
+            return None;
+        }
+        let mut raw = orig;
+        libc::cfmakeraw(&mut raw);
+        if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
+            return None;
+        }
+        Some(RawModeGuard {
+            orig,
+            fd,
+            active: true,
+        })
+    }
+}
+
+pub async fn run_attached_stream(
+    conn: UpgradedConnection,
+    tty: bool,
+    interactive: bool,
+) -> Result<()> {
+    let _raw_guard = if interactive && tty {
+        set_raw_mode()
+    } else {
+        None
+    };
+
+    let (mut read_stream, mut write_stream) = conn.stream.into_split();
+
+    let stdin_task = if interactive {
+        Some(tokio::spawn(async move {
+            let mut stdin = tokio::io::stdin();
+            let mut buf = [0u8; 1024];
+            loop {
+                match stdin.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if write_stream.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = write_stream.shutdown().await;
+        }))
+    } else {
+        None
+    };
+
+    use std::io::Write;
+    let mut pending = conn.leftover;
+    let mut read_buf = [0u8; 8192];
+    loop {
+        if !pending.is_empty() {
+            if tty {
+                let _ = std::io::stdout().write_all(&pending);
+                let _ = std::io::stdout().flush();
+                pending.clear();
+            } else {
+                while pending.len() >= 8 {
+                    let stream_type = pending[0];
+                    let len = u32::from_be_bytes([pending[4], pending[5], pending[6], pending[7]])
+                        as usize;
+                    if pending.len() < 8 + len {
+                        break;
+                    }
+                    let payload = &pending[8..8 + len];
+                    if stream_type == 2 {
+                        let _ = std::io::stderr().write_all(payload);
+                        let _ = std::io::stderr().flush();
+                    } else {
+                        let _ = std::io::stdout().write_all(payload);
+                        let _ = std::io::stdout().flush();
+                    }
+                    pending.drain(..8 + len);
+                }
+            }
+        }
+
+        match read_stream.read(&mut read_buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                pending.extend_from_slice(&read_buf[..n]);
+            }
+            Err(_) => break,
+        }
+    }
+
+    if let Some(t) = stdin_task {
+        t.abort();
     }
     Ok(())
 }

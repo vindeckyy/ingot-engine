@@ -119,6 +119,7 @@ pub struct ChildContext {
     pub bring_lo_up: bool,
     pub has_netns: bool,
     pub tty: bool,
+    pub seccomp: bool,
 }
 
 impl ChildContext {
@@ -265,7 +266,8 @@ fn child_main(ctx: &ChildContext) -> Result<(), i32> {
     // pre-pivot tree can survive as a shadowed copy when the oldroot
     // detach is refused, so mask it here too (Plan Phase 3, unit 3.2).
     // /proc, /sys and /dev/null all exist under merged by this point.
-    mask_paths(merged, "/dev/null");
+    mask_paths(merged, "/dev/null")
+        .map_err(|e| fail(e, "mask paths (pre-pivot)").err().unwrap())?;
 
     // 7. pivot_root into the overlay merged dir.
     if unsafe { libc::chdir(ctx.merged.as_ptr()) } != 0 {
@@ -286,7 +288,7 @@ fn child_main(ctx: &ChildContext) -> Result<(), i32> {
 
     // 7b. Masked paths, second pass (post-pivot, container-absolute):
     // whichever tree wins path resolution ends up masked.
-    mask_paths("", "/dev/null");
+    mask_paths("", "/dev/null").map_err(|e| fail(e, "mask paths (post-pivot)").err().unwrap())?;
     // 7c. Tmpfs mounts from HostConfig.Tmpfs.
     for (dest, opts) in &ctx.tmpfs {
         let d = dest.to_str().unwrap_or("/");
@@ -357,6 +359,16 @@ fn child_main(ctx: &ChildContext) -> Result<(), i32> {
     if ctx.no_new_privs {
         unsafe {
             libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        }
+    }
+
+    if ctx.seccomp && !ctx.privileged {
+        unsafe {
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        }
+        if let Err(e) = crate::seccomp::apply_default_seccomp() {
+            let msg = format!("apply seccomp: {e}");
+            return fail(125, &msg);
         }
     }
 
@@ -734,11 +746,7 @@ fn mkdirs(path: &str) {
     let _ = std::fs::create_dir_all(path);
 }
 
-/// Hide sensitive kernel interfaces (Plan Phase 3, unit 3.2). `root` is
-/// "" post-pivot (container-absolute paths) or the merged dir pre-pivot;
-/// `null` is a /dev/null visible from that tree. Best effort per path:
-/// slim images may lack them, and masking must never fail a start.
-fn mask_paths(root: &str, null: &str) {
+fn mask_paths(root: &str, null: &str) -> Result<(), i32> {
     // Files → bind /dev/null over them.
     for p in [
         "/proc/asound",
@@ -753,22 +761,24 @@ fn mask_paths(root: &str, null: &str) {
     ] {
         let t = format!("{root}{p}");
         if std::path::Path::new(&t).is_file() {
-            let _ = bind_file(null.as_bytes(), t.as_bytes());
+            bind_file(null.as_bytes(), t.as_bytes())?;
         }
     }
     // Directories → empty read-only tmpfs over them (mount rw first:
     // a fresh tmpfs mount rejects MS_RDONLY, so remount read-only after).
     for p in ["/sys/fs/selinux", "/proc/scsi", "/sys/firmware"] {
         let t = format!("{root}{p}");
-        if std::path::Path::new(&t).is_dir() && mount_tmpfs(&t, "mode=555").is_ok() {
-            let _ = mount_null(
+        if std::path::Path::new(&t).is_dir() {
+            mount_tmpfs(&t, "mode=555")?;
+            mount_null(
                 &t,
                 None,
                 libc::MS_RDONLY | libc::MS_REMOUNT | libc::MS_BIND,
                 None,
-            );
+            )?;
         }
     }
+    Ok(())
 }
 
 fn mknod(path: &str, mode: u32, major: u32, minor: u32) -> Result<(), i32> {

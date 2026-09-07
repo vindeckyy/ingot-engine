@@ -36,31 +36,19 @@ pub async fn create(
     Query(q): Query<CreateQuery>,
     body: axum::body::Bytes,
 ) -> Response {
-    if q.platform.is_some() {
-        // We only run linux/amd64; accept but ignore platform mismatches for now.
-    }
     let req: ContainerCreateBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
         Err(e) => {
-            tracing::debug!(
-                "create body rejected: {e}; body={}...",
-                String::from_utf8_lossy(&body)
-                    .chars()
-                    .take(2000)
-                    .collect::<String>()
-            );
+            tracing::debug!("create body rejected: {e}; body_len={}", body.len());
             return bad_request(format!("invalid container config: {e}"));
         }
     };
-    if req.Image.is_empty() {
-        return bad_request("no command specified"); // docker's error shape for empty image
-    }
     let mgr = match state.containers.as_ref() {
         Some(m) => m,
         None => return server_error("container manager not ready"),
     };
     let image_name = req.Image.clone();
-    match mgr.create(&image_name, req, q.name).await {
+    match mgr.create(&image_name, req, q.name, q.platform).await {
         Ok(handle) => {
             let id = handle.id();
             (
@@ -721,8 +709,14 @@ pub async fn remove(
     Path(id): Path<String>,
     Query(q): Query<RemoveQuery>,
 ) -> Response {
+    if q.link == Some(true) {
+        return bad_request("legacy links are not supported");
+    }
     let mgr = state.containers.as_ref().unwrap();
-    match mgr.remove(&id, q.force.unwrap_or(false)).await {
+    match mgr
+        .remove(&id, q.force.unwrap_or(false), q.v.unwrap_or(false))
+        .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => not_found_or(format!("{e:#}")),
     }
@@ -950,19 +944,16 @@ pub async fn restart(
     Query(q): Query<RestartQuery>,
 ) -> Response {
     let mgr = state.containers.as_ref().unwrap();
-    let handle = match mgr.get(&id).await {
-        Ok(Some(h)) => h,
-        _ => return not_found(format!("No such container: {id}")),
-    };
-    let record = handle.record.lock().unwrap().clone();
-    if handle.is_running() {
-        if let Err(e) = mgr.stop(&record.id, q.timeout, None).await {
-            return server_error(format!("{e:#}"));
-        }
-    }
-    match mgr.start(&record.id).await {
+    match mgr.restart(&id, q.timeout).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => server_error(format!("{e:#}")),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if msg.contains("No such container") {
+                not_found(msg)
+            } else {
+                server_error(msg)
+            }
+        }
     }
 }
 
@@ -1312,7 +1303,7 @@ pub async fn prune(State(state): State<SharedState>) -> Response {
             false
         };
         if !is_running {
-            if let Ok(()) = mgr.remove(&r.id, false).await {
+            if let Ok(()) = mgr.remove(&r.id, false, false).await {
                 deleted.push(r.id);
             }
         }
@@ -1446,8 +1437,15 @@ async fn archive_handle(
     };
 
     let merged = mgr.paths.overlay_merged(&record.id);
-    let rel_path = path_param.trim_start_matches('/');
-    let target = merged.join(rel_path);
+    let resolved = match ingot_util::resolve_in_root(&merged, std::path::Path::new(&path_param)) {
+        Ok(r) => r,
+        Err(_) => {
+            return not_found(format!(
+                "Could not find the file {path_param} in container {id}"
+            ));
+        }
+    };
+    let target = resolved.proc_path().to_path_buf();
 
     let meta = match std::fs::symlink_metadata(&target) {
         Ok(m) => m,
@@ -1458,6 +1456,7 @@ async fn archive_handle(
         }
     };
 
+    let rel_path = path_param.trim_start_matches('/');
     let name = std::path::Path::new(rel_path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -1556,7 +1555,7 @@ pub async fn archive_put(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     Query(q): Query<ArchivePutQuery>,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Response {
     let mgr = state.containers.as_ref().unwrap();
     let handle = match mgr.get(&id).await {
@@ -1569,6 +1568,16 @@ pub async fn archive_put(
     if q.path.is_empty() {
         return bad_request("Path cannot be empty");
     }
+
+    let temp_file =
+        match crate::handlers::stream_body_to_temp_file(body, 10 * 1024 * 1024 * 1024).await {
+            Ok(f) => f,
+            Err(resp) => return resp,
+        };
+    let file = match temp_file.reopen() {
+        Ok(f) => f,
+        Err(e) => return server_error(format!("failed to reopen temp archive: {e}")),
+    };
 
     if !is_running {
         let img_id = record.image_id.trim_start_matches("sha256:");
@@ -1588,24 +1597,33 @@ pub async fn archive_put(
     };
 
     let merged = mgr.paths.overlay_merged(&record.id);
-    let rel_path = q.path.trim_start_matches('/');
-    let target = merged.join(rel_path);
+    let dest_res =
+        match ingot_util::ensure_dir_in_root(&merged, std::path::Path::new(&q.path), 0o755) {
+            Ok(r) => r,
+            Err(e) => {
+                return bad_request(format!(
+                    "Failed to resolve target directory {:?} in container: {e}",
+                    q.path
+                ));
+            }
+        };
+    let target = dest_res.proc_path().to_path_buf();
 
-    if let Err(e) = std::fs::create_dir_all(&target) {
-        return server_error(format!(
-            "Failed to create target directory {}: {e}",
-            target.display()
-        ));
-    }
-
-    let mut archive = tar::Archive::new(std::io::Cursor::new(body));
+    let mut archive = tar::Archive::new(std::io::BufReader::new(file));
     archive.set_preserve_permissions(true);
     archive.set_preserve_mtime(true);
-    if let Err(e) = archive.unpack(&target) {
-        return server_error(format!(
-            "Failed to unpack archive into {}: {e}",
-            target.display()
-        ));
+    let entries = match archive.entries() {
+        Ok(e) => e,
+        Err(e) => return bad_request(format!("invalid tar archive: {e}")),
+    };
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(e) => e,
+            Err(e) => return bad_request(format!("invalid tar entry: {e}")),
+        };
+        if let Err(e) = entry.unpack_in(&target) {
+            return bad_request(format!("failed to unpack archive entry: {e}"));
+        }
     }
 
     StatusCode::OK.into_response()

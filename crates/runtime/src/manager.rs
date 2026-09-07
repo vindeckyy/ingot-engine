@@ -56,6 +56,20 @@ pub struct ContainerManager {
     pub self_ref: RwLock<Option<Weak<ContainerManager>>>,
     live: RwLock<HashMap<String, Arc<ContainerHandle>>>,
     execs: RwLock<HashMap<String, Arc<crate::exec::ExecSession>>>,
+    create_reservations: Arc<std::sync::Mutex<HashSet<String>>>,
+    lifecycle_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+struct ReservationGuard {
+    reservations: Arc<std::sync::Mutex<HashSet<String>>>,
+    name: String,
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        let mut set = self.reservations.lock().unwrap();
+        set.remove(&self.name);
+    }
 }
 
 impl ContainerManager {
@@ -72,7 +86,16 @@ impl ContainerManager {
             self_ref: RwLock::new(None),
             live: RwLock::new(HashMap::new()),
             execs: RwLock::new(HashMap::new()),
+            create_reservations: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn lifecycle_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.lifecycle_locks.lock().unwrap();
+        map.entry(id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     // ---------- create ----------
@@ -82,9 +105,10 @@ impl ContainerManager {
         image_name: &str,
         mut body: ContainerCreateBody,
         name: Option<String>,
+        platform: Option<String>,
     ) -> Result<Arc<ContainerHandle>, crate::error::CreateError> {
         use crate::error::{validate_create, CreateError};
-        validate_create(&body, name.as_deref())?;
+        validate_create(&body, name.as_deref(), platform.as_deref())?;
         let image_id = self
             .images
             .resolve(&body.Image)
@@ -129,17 +153,25 @@ impl ContainerManager {
         let id = ingot_util::new_id();
         let name = match name {
             Some(n) => {
-                if self.name_taken(&n).await {
+                let mut res = self.create_reservations.lock().unwrap();
+                if res.contains(&n) || self.name_taken(&n) {
                     return Err(crate::error::CreateError::Conflict(n));
                 }
+                res.insert(n.clone());
                 n
             }
             None => loop {
                 let candidate = ingot_util::name::random_name();
-                if !self.name_taken(&candidate).await {
+                let mut res = self.create_reservations.lock().unwrap();
+                if !res.contains(&candidate) && !self.name_taken(&candidate) {
+                    res.insert(candidate.clone());
                     break candidate;
                 }
             },
+        };
+        let _res_guard = ReservationGuard {
+            reservations: self.create_reservations.clone(),
+            name: name.clone(),
         };
 
         let hostname = if body.Hostname.is_empty() {
@@ -159,7 +191,7 @@ impl ContainerManager {
         // HEALTHCHECK apply instead of silently falling back to defaults.
         inherit_image_config(&mut config, &image.config);
 
-        let mounts = self
+        let (mounts, anon_vols) = self
             .resolve_mounts(&body.HostConfig, &image, body.Volumes.as_ref(), &id)
             .await?;
 
@@ -236,25 +268,47 @@ impl ContainerManager {
 
         // Persist.
         let dir = self.paths.container(&id);
-        std::fs::create_dir_all(dir.join("logs"))?;
-        ingot_store::write_json_atomic(&self.paths.container_config(&id), &record)?;
-        ingot_store::write_json_atomic(&self.paths.container_hostconfig(&id), &record.hostconfig)?;
+        let persist_res: Result<()> = (|| {
+            std::fs::create_dir_all(dir.join("logs"))?;
+            ingot_store::write_json_atomic(&self.paths.container_config(&id), &record)?;
+            ingot_store::write_json_atomic(
+                &self.paths.container_hostconfig(&id),
+                &record.hostconfig,
+            )?;
 
-        std::fs::write(
-            self.paths.container_hostname(&id),
-            format!("{}\n", record.config.Hostname),
-        )?;
-        std::fs::write(
-            self.paths.container_hosts(&id),
-            default_hosts(&record, "", ""),
-        )?;
-        std::fs::write(self.paths.container_resolv(&id), build_resolv(&record, &[]))?;
+            std::fs::write(
+                self.paths.container_hostname(&id),
+                format!("{}\n", record.config.Hostname),
+            )?;
+            std::fs::write(
+                self.paths.container_hosts(&id),
+                default_hosts(&record, "", ""),
+            )?;
+            std::fs::write(self.paths.container_resolv(&id), build_resolv(&record, &[]))?;
+            Ok(())
+        })();
 
         let state = ContainerState {
             status: StateStatus::Created,
             ..Default::default()
         };
-        ingot_store::write_json_atomic(&self.paths.container_state(&id), &state)?;
+
+        if persist_res.is_ok() {
+            if let Err(e) = ingot_store::write_json_atomic(&self.paths.container_state(&id), &state)
+            {
+                for v in &anon_vols {
+                    let _ = ingot_util::remove_path(&self.paths.volumes().join(v));
+                }
+                let _ = ingot_util::remove_path(&dir);
+                return Err(crate::error::CreateError::Internal(e));
+            }
+        } else if let Err(e) = persist_res {
+            for v in &anon_vols {
+                let _ = ingot_util::remove_path(&self.paths.volumes().join(v));
+            }
+            let _ = ingot_util::remove_path(&dir);
+            return Err(crate::error::CreateError::Internal(e));
+        }
 
         let (hub, stdin_rx) = StdioHub::new(self.paths.container_log(&id));
         let handle = Arc::new(ContainerHandle {
@@ -279,8 +333,8 @@ impl ContainerManager {
         Ok(handle)
     }
 
-    async fn name_taken(&self, name: &str) -> bool {
-        self.list_records().await.iter().any(|r| r.name == name)
+    fn name_taken(&self, name: &str) -> bool {
+        self.list_records_sync().iter().any(|r| r.name == name)
     }
 
     async fn resolve_mounts(
@@ -289,8 +343,9 @@ impl ContainerManager {
         image: &ingot_image::ImageRecord,
         body_volumes: Option<&HashMap<String, serde_json::Value>>,
         _container_id: &str,
-    ) -> Result<Vec<crate::record::MountRecord>> {
+    ) -> Result<(Vec<crate::record::MountRecord>, Vec<String>)> {
         let mut out = Vec::new();
+        let mut anon_vols = Vec::new();
         for bind in &hostconfig.Binds {
             let (spec, ro) = match bind.strip_suffix(":ro") {
                 Some(s) => (s, true),
@@ -304,6 +359,7 @@ impl ContainerManager {
                         source: source.to_string(),
                         destination: dest.to_string(),
                         read_only: ro,
+                        is_anonymous: false,
                     });
                 } else {
                     // Named volume!
@@ -326,6 +382,7 @@ impl ContainerManager {
                         source: dir.to_string_lossy().to_string(),
                         destination: dest.to_string(),
                         read_only: ro,
+                        is_anonymous: false,
                     });
                 }
             } else {
@@ -343,12 +400,14 @@ impl ContainerManager {
                     "options": {}
                 });
                 let _ = ingot_store::write_json_atomic(&meta_path, &meta);
+                anon_vols.push(n.clone());
                 out.push(crate::record::MountRecord {
                     typ: "volume".into(),
                     name: n,
                     source: dir.to_string_lossy().to_string(),
                     destination: dest.to_string(),
                     read_only: ro,
+                    is_anonymous: true,
                 });
             }
         }
@@ -359,7 +418,8 @@ impl ContainerManager {
                 m.typ.clone()
             };
             if typ == "volume" {
-                let name = if m.Source.is_empty() {
+                let is_anon = m.Source.is_empty();
+                let name = if is_anon {
                     ingot_util::new_id()[..32].to_string()
                 } else {
                     m.Source.clone()
@@ -377,12 +437,16 @@ impl ContainerManager {
                     });
                     let _ = ingot_store::write_json_atomic(&meta_path, &meta);
                 }
+                if is_anon {
+                    anon_vols.push(name.clone());
+                }
                 out.push(crate::record::MountRecord {
                     typ: "volume".into(),
                     name,
                     source: dir.to_string_lossy().to_string(),
                     destination: m.Target.clone(),
                     read_only: m.read_only,
+                    is_anonymous: is_anon,
                 });
             } else {
                 out.push(crate::record::MountRecord {
@@ -391,6 +455,7 @@ impl ContainerManager {
                     source: m.Source.clone(),
                     destination: m.Target.clone(),
                     read_only: m.read_only,
+                    is_anonymous: false,
                 });
             }
         }
@@ -410,12 +475,14 @@ impl ContainerManager {
                         "options": {}
                     });
                     let _ = ingot_store::write_json_atomic(&meta_path, &meta);
+                    anon_vols.push(n.clone());
                     out.push(crate::record::MountRecord {
                         typ: "volume".into(),
                         name: n,
                         source: dir.to_string_lossy().to_string(),
                         destination: dest.clone(),
                         read_only: false,
+                        is_anonymous: true,
                     });
                 }
             }
@@ -436,17 +503,19 @@ impl ContainerManager {
                         "options": {}
                     });
                     let _ = ingot_store::write_json_atomic(&meta_path, &meta);
+                    anon_vols.push(n.clone());
                     out.push(crate::record::MountRecord {
                         typ: "volume".into(),
                         name: n,
                         source: dir.to_string_lossy().to_string(),
                         destination: dest.clone(),
                         read_only: false,
+                        is_anonymous: true,
                     });
                 }
             }
         }
-        Ok(out)
+        Ok((out, anon_vols))
     }
 
     // ---------- start ----------
@@ -462,6 +531,9 @@ impl ContainerManager {
                 .get(id_or_name)
                 .await?
                 .ok_or_else(|| anyhow!("No such container: {id_or_name}"))?;
+            let record = handle.record.lock().unwrap().clone();
+            let lock = self.lifecycle_lock(&record.id);
+            let _lifecycle = lock.lock().await;
             {
                 let st = handle.state.lock().unwrap();
                 if st.status == StateStatus::Running {
@@ -469,7 +541,6 @@ impl ContainerManager {
                 }
             }
 
-            let record = handle.record.lock().unwrap().clone();
             let image_id = record.image_id.trim_start_matches("sha256:").to_string();
             let image = self
                 .images
@@ -598,6 +669,12 @@ impl ContainerManager {
                 cap_drop,
                 privileged: record.hostconfig.Privileged,
                 no_new_privs: !record.hostconfig.Privileged,
+                seccomp: !record.hostconfig.Privileged
+                    && !record
+                        .hostconfig
+                        .SecurityOpt
+                        .iter()
+                        .any(|s| s == "seccomp=unconfined" || s == "seccomp:unconfined"),
                 readonly_rootfs: record.hostconfig.ReadonlyRootfs,
                 bring_lo_up: network_mode == "none" || self.net.read().unwrap().is_none(),
                 has_netns: !matches!(network_mode.as_str(), "host" | ""),
@@ -652,31 +729,74 @@ impl ContainerManager {
             }
 
             // ---- cgroup ----
-            let cgroup = Cgroup::create(&record.id).ok();
-            if let Some(cg) = &cgroup {
-                let _ = cg.apply(
-                    record.hostconfig.Memory,
-                    record.hostconfig.NanoCpus,
-                    record.hostconfig.CpuShares,
-                    record.hostconfig.PidsLimit,
-                    &record.hostconfig.CpusetCpus,
-                );
-                let _ = cg.add_pid(pid as i64);
-            }
+            let cgroup = match Cgroup::create(&record.id) {
+                Ok(cg) => {
+                    if let Err(e) = cg.apply(
+                        record.hostconfig.Memory,
+                        record.hostconfig.NanoCpus,
+                        record.hostconfig.CpuShares,
+                        record.hostconfig.PidsLimit,
+                        &record.hostconfig.CpusetCpus,
+                    ) {
+                        let _ = write_ready(&ready_tx, b'e');
+                        reap_now(pid);
+                        cg.remove();
+                        let _ = overlay::unmount_rootfs(&self.paths, &record.id);
+                        return Err(anyhow!("failed to apply cgroup limits: {e:#}"));
+                    }
+                    if let Err(e) = cg.add_pid(pid as i64) {
+                        let _ = write_ready(&ready_tx, b'e');
+                        reap_now(pid);
+                        cg.remove();
+                        let _ = overlay::unmount_rootfs(&self.paths, &record.id);
+                        return Err(anyhow!("failed to place pid in cgroup: {e:#}"));
+                    }
+                    cg
+                }
+                Err(e) => {
+                    let _ = write_ready(&ready_tx, b'e');
+                    reap_now(pid);
+                    let _ = overlay::unmount_rootfs(&self.paths, &record.id);
+                    return Err(anyhow!("failed to create cgroup: {e:#}"));
+                }
+            };
 
             // ---- netns bind + network attach ----
             let netns_path = self.paths.netns_bind(&record.id);
-            std::fs::create_dir_all(netns_path.parent().unwrap())?;
+            if let Some(parent) = netns_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             let _ = std::fs::remove_file(&netns_path);
             let netns_src = format!("/proc/{pid}/ns/net");
             if std::path::Path::new(&netns_src).exists() {
-                let _ = bind_mount(&netns_src, netns_path.to_str().unwrap());
+                std::fs::File::create(&netns_path)?;
+                if let Err(e) = bind_mount(&netns_src, netns_path.to_str().unwrap()) {
+                    let _ = write_ready(&ready_tx, b'e');
+                    reap_now(pid);
+                    let _ = std::fs::remove_file(&netns_path);
+                    cgroup.remove();
+                    let _ = overlay::unmount_rootfs(&self.paths, &record.id);
+                    return Err(anyhow!("failed to bind netns: {e:#}"));
+                }
             }
             let mntns_path = self.paths.container_mntns(&record.id);
+            if let Some(parent) = mntns_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let _ = std::fs::remove_file(&mntns_path);
             let mntns_src = format!("/proc/{pid}/ns/mnt");
             if std::path::Path::new(&mntns_src).exists() {
-                let _ = bind_mount(&mntns_src, mntns_path.to_str().unwrap());
+                std::fs::File::create(&mntns_path)?;
+                if let Err(e) = bind_mount(&mntns_src, mntns_path.to_str().unwrap()) {
+                    let _ = write_ready(&ready_tx, b'e');
+                    reap_now(pid);
+                    let _ = unbind_mount(netns_path.to_str().unwrap());
+                    let _ = std::fs::remove_file(&netns_path);
+                    let _ = std::fs::remove_file(&mntns_path);
+                    cgroup.remove();
+                    let _ = overlay::unmount_rootfs(&self.paths, &record.id);
+                    return Err(anyhow!("failed to bind mntns: {e:#}"));
+                }
             }
 
             let mut ip = String::new();
@@ -746,6 +866,11 @@ impl ContainerManager {
                 if let Some(msg) = resolve_failed {
                     let _ = write_ready(&ready_tx, b'e');
                     reap_now(pid);
+                    let _ = unbind_mount(mntns_path.to_str().unwrap());
+                    let _ = std::fs::remove_file(&mntns_path);
+                    let _ = unbind_mount(netns_path.to_str().unwrap());
+                    let _ = std::fs::remove_file(&netns_path);
+                    cgroup.remove();
                     let _ = overlay::unmount_rootfs(&self.paths, &record.id);
                     return Err(anyhow!(
                         "network attach failed: {msg}; container init aborted"
@@ -896,6 +1021,11 @@ impl ContainerManager {
                                         net.unpublish_all(&record.id).await;
                                         let _ = write_ready(&ready_tx, b'e');
                                         reap_now(pid);
+                                        let _ = unbind_mount(mntns_path.to_str().unwrap());
+                                        let _ = std::fs::remove_file(&mntns_path);
+                                        let _ = unbind_mount(netns_path.to_str().unwrap());
+                                        let _ = std::fs::remove_file(&netns_path);
+                                        cgroup.remove();
                                         let _ = overlay::unmount_rootfs(&self.paths, &record.id);
                                         return Err(anyhow!(
                                             "port publish failed: {e:#}; container init aborted"
@@ -913,6 +1043,11 @@ impl ContainerManager {
                             }
                             let _ = write_ready(&ready_tx, b'e');
                             reap_now(pid);
+                            let _ = unbind_mount(mntns_path.to_str().unwrap());
+                            let _ = std::fs::remove_file(&mntns_path);
+                            let _ = unbind_mount(netns_path.to_str().unwrap());
+                            let _ = std::fs::remove_file(&netns_path);
+                            cgroup.remove();
                             let _ = overlay::unmount_rootfs(&self.paths, &record.id);
                             return Err(anyhow!(
                                 "network attach failed: {e:#}; container init aborted"
@@ -1061,7 +1196,7 @@ impl ContainerManager {
             tokio::task::spawn_blocking(move || {
                 // OOM baseline (unit 2.5): a SIGKILL exit only counts as an
                 // OOM kill if the cgroup counter moved while we ran.
-                let oom_base = cg.as_ref().map(|c| c.oom_kills()).unwrap_or(0);
+                let oom_base = cg.oom_kills();
                 let mut status = 0;
                 let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
                 let signaled = rc == pid && libc::WIFSIGNALED(status);
@@ -1077,8 +1212,7 @@ impl ContainerManager {
                 } else {
                     -1
                 };
-                let oom_killed =
-                    signo == libc::SIGKILL && cg.as_ref().is_some_and(|c| c.oom_kills() > oom_base);
+                let oom_killed = signo == libc::SIGKILL && cg.oom_kills() > oom_base;
                 let mut should_restart = false;
                 {
                     let mut st = mgr_handle.state.lock().unwrap();
@@ -1130,9 +1264,7 @@ impl ContainerManager {
                     &paths.container_state(&live_id),
                     &*mgr_handle.state.lock().unwrap(),
                 );
-                if let Some(cg) = cg {
-                    cg.remove();
-                }
+                cg.remove();
                 let _ = overlay::unmount_rootfs(&paths, &live_id);
                 tracing::debug!(container = %live_id, exit = exit_code, "reaper: publishing die");
                 events.publish(EventMessage::new(
@@ -1149,12 +1281,13 @@ impl ContainerManager {
                     // handle, publish destroy. Filesystem-only cleanup
                     // here used to strand a lease + port rules + the live
                     // entry on every --rm run.
-                    let (name, hostname, endpoints) = {
+                    let (name, hostname, endpoints, mounts) = {
                         let rec = mgr_handle.record.lock().unwrap();
                         (
                             rec.name.clone(),
                             rec.config.Hostname.clone(),
                             rec.endpoints.clone(),
+                            rec.mounts.clone(),
                         )
                     };
                     let netmgr = netmgr.clone();
@@ -1166,6 +1299,12 @@ impl ContainerManager {
                                 let mut keys = vec![name.clone(), hostname.clone()];
                                 keys.extend(ep.aliases.clone());
                                 net.detach(&ep.network_id, &ep.ip, &live_id, &keys).await;
+                            }
+                        }
+                        for m in &mounts {
+                            if m.is_anonymous && m.typ == "volume" && !m.name.is_empty() {
+                                let dir = paths.volumes().join(&m.name);
+                                let _ = ingot_util::remove_path(&dir);
                             }
                         }
                         let _ = cleanup_container(&paths, &live_id);
@@ -1215,6 +1354,18 @@ impl ContainerManager {
             .get(id_or_name)
             .await?
             .ok_or_else(|| anyhow!("No such container: {id_or_name}"))?;
+        let rid = handle.id();
+        let lock = self.lifecycle_lock(&rid);
+        let _lifecycle = lock.lock().await;
+        self.stop_handle(&handle, timeout, signal).await
+    }
+
+    async fn stop_handle(
+        &self,
+        handle: &ContainerHandle,
+        timeout: Option<i64>,
+        signal: Option<i32>,
+    ) -> Result<i64> {
         handle.manual_stop.store(true, Ordering::SeqCst);
         let (pid, signal, timeout) = {
             let state = handle.state.lock().unwrap();
@@ -1226,13 +1377,12 @@ impl ContainerManager {
             let signal = signal.unwrap_or_else(|| rec.stop_signal() as i32);
             (state.pid as i32, signal, timeout)
         };
-        tracing::debug!(container = id_or_name, timeout, "stop: entered");
+        let id = handle.id();
+        tracing::debug!(container = %id, timeout, "stop: entered");
         // Subscribe BEFORE signalling: the process may exit immediately.
         let mut rx = handle.subscribe_exit();
         tracing::debug!(pid, "stop: sending signal");
-        unsafe {
-            libc::kill(pid, signal as libc::c_int);
-        }
+        let _ = send_signal(pid, signal);
         match tokio::time::timeout(std::time::Duration::from_secs(timeout), rx.recv()).await {
             Ok(Ok(code)) => {
                 tracing::debug!("stop: graceful exit {code}");
@@ -1241,9 +1391,7 @@ impl ContainerManager {
             Ok(Err(e)) => tracing::debug!("stop: recv error {e}"),
             Err(_) => tracing::debug!("stop: grace period expired"),
         }
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
+        let _ = send_signal(pid, libc::SIGKILL);
         // Bounded final wait; report whatever state we reach.
         match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
             Ok(Ok(code)) => Ok(code),
@@ -1256,6 +1404,9 @@ impl ContainerManager {
             .get(id_or_name)
             .await?
             .ok_or_else(|| anyhow!("No such container: {id_or_name}"))?;
+        let rid = handle.id();
+        let lock = self.lifecycle_lock(&rid);
+        let _lifecycle = lock.lock().await;
         handle.manual_stop.store(true, Ordering::SeqCst);
         let pid = {
             let st = handle.state.lock().unwrap();
@@ -1264,11 +1415,7 @@ impl ContainerManager {
             }
             st.pid as i32
         };
-        let rc = unsafe { libc::kill(pid as i32, signal) };
-        if rc != 0 {
-            return Err(anyhow!("kill: {}", std::io::Error::last_os_error()));
-        }
-        Ok(())
+        send_signal(pid, signal)
     }
 
     pub async fn pause(&self, id_or_name: &str, on: bool) -> Result<()> {
@@ -1276,6 +1423,9 @@ impl ContainerManager {
             .get(id_or_name)
             .await?
             .ok_or_else(|| anyhow!("No such container: {id_or_name}"))?;
+        let rid = handle.id();
+        let lock = self.lifecycle_lock(&rid);
+        let _lifecycle = lock.lock().await;
         {
             // Strict state machine (Plan Phase 2, unit 2.6): pause only a
             // running container, unpause only a paused one.
@@ -1290,15 +1440,68 @@ impl ContainerManager {
                 return Err(anyhow!("container is not paused"));
             }
         }
-        let rid = handle.id();
         let cg = Cgroup::create(&rid)?;
         cg.freeze(on)?;
-        let mut st = handle.state.lock().unwrap();
-        st.status = if on {
-            StateStatus::Paused
-        } else {
-            StateStatus::Running
-        };
+        {
+            let mut st = handle.state.lock().unwrap();
+            st.status = if on {
+                StateStatus::Paused
+            } else {
+                StateStatus::Running
+            };
+        }
+        self.persist_state(&handle).await;
+        self.events.publish(EventMessage::new(
+            "container",
+            if on { "pause" } else { "unpause" },
+            &rid,
+            container_attrs(&handle),
+        ));
+        Ok(())
+    }
+
+    pub async fn restart(&self, id_or_name: &str, timeout: Option<i64>) -> Result<()> {
+        let handle = self
+            .get(id_or_name)
+            .await?
+            .ok_or_else(|| anyhow!("No such container: {id_or_name}"))?;
+        let rid = handle.id();
+        let lock = self.lifecycle_lock(&rid);
+        let _lifecycle = lock.lock().await;
+        if handle.is_running() {
+            {
+                let mut st = handle.state.lock().unwrap();
+                st.status = StateStatus::Restarting;
+            }
+            self.persist_state(&handle).await;
+            self.events.publish(EventMessage::new(
+                "container",
+                "restart",
+                &rid,
+                container_attrs(&handle),
+            ));
+            let (pid, signal, timeout_secs) = {
+                let rec = handle.record.lock().unwrap();
+                let t = timeout.or(rec.config.StopTimeout).unwrap_or(10).max(0) as u64;
+                let s = rec.stop_signal() as i32;
+                let st = handle.state.lock().unwrap();
+                (st.pid as i32, s, t)
+            };
+            handle.manual_stop.store(true, Ordering::SeqCst);
+            let mut rx = handle.subscribe_exit();
+            let _ = send_signal(pid, signal);
+            let stopped = matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx.recv()).await,
+                Ok(Ok(_))
+            );
+            if !stopped {
+                let _ = send_signal(pid, libc::SIGKILL);
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+            }
+        }
+        drop(_lifecycle);
+        drop(lock);
+        self.start(&rid).await?;
         Ok(())
     }
 
@@ -1347,7 +1550,7 @@ impl ContainerManager {
         }
     }
 
-    pub async fn list_records(&self) -> Vec<ContainerRecord> {
+    pub fn list_records_sync(&self) -> Vec<ContainerRecord> {
         let mut out = Vec::new();
         let Ok(rd) = std::fs::read_dir(self.paths.containers()) else {
             return out;
@@ -1367,21 +1570,27 @@ impl ContainerManager {
         out
     }
 
+    pub async fn list_records(&self) -> Vec<ContainerRecord> {
+        self.list_records_sync()
+    }
+
     pub async fn persist_state(&self, handle: &ContainerHandle) {
         let id = handle.id();
         let st = handle.state.lock().unwrap().clone();
         let _ = ingot_store::write_json_atomic(&self.paths.container_state(&id), &st);
     }
 
-    pub async fn remove(&self, id_or_name: &str, force: bool) -> Result<()> {
+    pub async fn remove(&self, id_or_name: &str, force: bool, remove_volumes: bool) -> Result<()> {
         let handle = self
             .get(id_or_name)
             .await?
             .ok_or_else(|| anyhow!("No such container: {id_or_name}"))?;
-        let (rid, status) = {
-            let r = handle.record.lock().unwrap();
+        let rid = handle.id();
+        let lock = self.lifecycle_lock(&rid);
+        let _lifecycle = lock.lock().await;
+        let status = {
             let s = handle.state.lock().unwrap();
-            (r.id.clone(), s.status)
+            s.status
         };
         if status == StateStatus::Running {
             if !force {
@@ -1389,7 +1598,7 @@ impl ContainerManager {
                     "cannot remove container: container is running: stop the container before removing"
                 ));
             }
-            let _ = self.stop(&rid, Some(0), None).await;
+            let _ = self.stop_handle(&handle, Some(0), None).await;
         }
         // Network cleanup: unpublish ports, drop veths, release IPs,
         // deregister endpoint DNS names.
@@ -1409,6 +1618,15 @@ impl ContainerManager {
                     let mut keys = vec![name.clone(), hostname.clone()];
                     keys.extend(ep.aliases.clone());
                     net.detach(&ep.network_id, &ep.ip, &rid, &keys).await;
+                }
+            }
+        }
+        if remove_volumes {
+            let mounts = handle.record.lock().unwrap().mounts.clone();
+            for m in &mounts {
+                if m.is_anonymous && m.typ == "volume" && !m.name.is_empty() {
+                    let dir = self.paths.volumes().join(&m.name);
+                    let _ = ingot_util::remove_path(&dir);
                 }
             }
         }
@@ -1692,47 +1910,59 @@ fn apply_mounts(paths: &DataPaths, record: &ContainerRecord) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let merged = paths.overlay_merged(&record.id);
     for m in &record.mounts {
-        let dest = merged.join(m.destination.trim_start_matches('/'));
-        let dest_str = dest.as_os_str().as_bytes().to_vec();
         match m.typ.as_str() {
             "tmpfs" => {
-                std::fs::create_dir_all(&dest)?;
+                let dest_res = ingot_util::ensure_dir_in_root(
+                    &merged,
+                    std::path::Path::new(&m.destination),
+                    0o755,
+                )?;
+                let dest_str = dest_res.proc_path().as_os_str().as_bytes().to_vec();
                 mount_fs_raw("tmpfs", &dest_str, "mode=1777")?;
             }
             "volume" | "bind" => {
                 let src = std::path::Path::new(&m.source);
-                if m.typ == "bind" {
+                let dest_res = if m.typ == "bind" {
                     if src.is_file() {
-                        if let Some(parent) = dest.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        if !dest.exists() {
-                            let _ = std::fs::File::create(&dest);
-                        }
+                        ingot_util::ensure_file_in_root(
+                            &merged,
+                            std::path::Path::new(&m.destination),
+                            0o644,
+                        )?
                     } else {
                         if !src.exists() {
                             std::fs::create_dir_all(src)?;
                         }
-                        std::fs::create_dir_all(&dest)?;
+                        ingot_util::ensure_dir_in_root(
+                            &merged,
+                            std::path::Path::new(&m.destination),
+                            0o755,
+                        )?
                     }
                 } else {
                     // volume
                     if !src.exists() {
                         std::fs::create_dir_all(src)?;
                     }
+                    let res = ingot_util::ensure_dir_in_root(
+                        &merged,
+                        std::path::Path::new(&m.destination),
+                        0o755,
+                    )?;
                     let is_empty = match std::fs::read_dir(src) {
                         Ok(entries) => entries
                             .filter_map(|e| e.ok())
                             .all(|e| e.file_name() == "metadata.json"),
                         Err(_) => true,
                     };
-                    if is_empty && dest.is_dir() {
-                        let _ = copy_tree(&dest, src);
+                    if is_empty && res.is_dir() {
+                        let _ = copy_tree(res.proc_path(), src);
                     }
-                    std::fs::create_dir_all(&dest)?;
-                }
+                    res
+                };
                 let src_c = std::ffi::CString::new(src.as_os_str().as_bytes().to_vec())?;
-                let dst_c = std::ffi::CString::new(dest_str.clone())?;
+                let dst_c =
+                    std::ffi::CString::new(dest_res.proc_path().as_os_str().as_bytes().to_vec())?;
                 let flags: libc::c_ulong =
                     libc::MS_BIND | if m.read_only { libc::MS_RDONLY } else { 0 };
                 let rc = unsafe {
@@ -1755,14 +1985,21 @@ fn apply_mounts(paths: &DataPaths, record: &ContainerRecord) -> Result<()> {
                 if m.read_only {
                     // Bind-remount to apply RDONLY.
                     let flags2: libc::c_ulong = libc::MS_BIND | libc::MS_RDONLY | libc::MS_REMOUNT;
-                    unsafe {
+                    let rc2 = unsafe {
                         libc::mount(
                             std::ptr::null(),
                             dst_c.as_ptr(),
                             std::ptr::null(),
                             flags2,
                             std::ptr::null(),
-                        );
+                        )
+                    };
+                    if rc2 != 0 {
+                        return Err(anyhow!(
+                            "remount ro {} failed: {}",
+                            m.destination,
+                            std::io::Error::last_os_error()
+                        ));
                     }
                 }
             }
@@ -1931,6 +2168,9 @@ pub fn cleanup_container(paths: &DataPaths, id: &str) -> Result<()> {
 pub fn cleanup_runtime_state(paths: &DataPaths, id: &str) -> Result<()> {
     let _ = overlay::unmount_rootfs(paths, id);
     ingot_util::remove_path(&paths.overlay_container(id))?;
+    let _ = unbind_mount(&paths.container_mntns(id).to_string_lossy());
+    let _ = ingot_util::remove_path(&paths.container_mntns(id));
+    let _ = unbind_mount(&paths.netns_bind(id).to_string_lossy());
     ingot_util::remove_path(&paths.netns_bind(id))?;
     Ok(())
 }
@@ -2072,6 +2312,54 @@ fn inherit_image_config(config: &mut ContainerConfig, image: &ContainerConfig) {
     if config.Healthcheck.is_none() {
         config.Healthcheck = image.Healthcheck.clone();
     }
+}
+
+fn send_signal(pid: i32, sig: i32) -> Result<()> {
+    if pid <= 0 {
+        return Ok(());
+    }
+    // Try pidfd first to avoid race conditions with recycled PIDs
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as i32 };
+    if pidfd >= 0 {
+        let ret = unsafe {
+            let r = libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd,
+                sig,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            );
+            libc::close(pidfd);
+            r
+        };
+        if ret == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(anyhow!("pidfd_send_signal({pid}, {sig}): {err}"));
+    }
+
+    // Fallback to kill(pid, sig)
+    let ret = unsafe { libc::kill(pid, sig) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(anyhow!("kill({pid}, {sig}): {err}"));
+    }
+    Ok(())
+}
+
+fn unbind_mount(path: &str) -> Result<()> {
+    let p = std::path::Path::new(path);
+    if p.exists() {
+        let _ = nix::mount::umount2(p, nix::mount::MntFlags::MNT_DETACH);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
