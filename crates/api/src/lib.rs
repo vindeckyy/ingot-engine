@@ -7,12 +7,14 @@
 
 pub mod container;
 pub mod de;
+pub mod filters;
 pub mod image;
 pub mod network;
 pub mod system;
 pub mod volume;
 
 pub use container::*;
+pub use filters::*;
 pub use image::*;
 pub use network::*;
 pub use system::*;
@@ -20,8 +22,9 @@ pub use volume::*;
 
 /// API version we claim in `/_ping` (Docker 25.0-era).
 pub const API_VERSION: &str = "1.44";
-/// Oldest API version we accept from clients.
-pub const MIN_API_VERSION: &str = "1.44";
+/// Oldest API version we accept from clients (Plan Phase 1, unit 1.4:
+/// the router serves every minor from here to [`API_VERSION`]).
+pub const MIN_API_VERSION: &str = "1.24";
 /// Engine version string reported by /version.
 pub const ENGINE_VERSION: &str = "0.1.0";
 /// Request header carrying a one-time build-secret token (POST /secrets).

@@ -804,50 +804,19 @@ pub async fn logs(
         .map(|d| d.timestamp());
     let timestamps = q.timestamps.unwrap_or(false);
 
-    // Read historical lines.
+    // Read historical lines off the executor: typed parse, ring-buffer
+    // tail, reverse-scan fast path for tail=N without since/until.
     let log_path = state.paths.container_log(&record.id);
-    let raw = std::fs::read(&log_path).unwrap_or_default();
-    let mut lines: Vec<(u8, Vec<u8>, String)> = Vec::new();
-    for line in raw.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
-            let stream = if v["stream"] == "stderr" {
-                ingot_runtime::stdio::STREAM_STDERR
-            } else {
-                ingot_runtime::stdio::STREAM_STDOUT
-            };
-            let time = v["time"].as_str().unwrap_or("").to_string();
-            let ts = parse_log_time(&time).map(|d| d.timestamp()).unwrap_or(0);
-            if since.is_some_and(|s| ts < s) {
-                continue;
-            }
-            if until.is_some_and(|u| ts > u) {
-                continue;
-            }
-            let log_text = v["log"].as_str().unwrap_or("").to_string();
-            let data = if timestamps && !log_text.is_empty() {
-                let mut out = format!("{time} ").into_bytes();
-                out.extend_from_slice(log_text.as_bytes());
-                out
-            } else {
-                log_text.into_bytes()
-            };
-            let keep = (stream == ingot_runtime::stdio::STREAM_STDOUT && want_out)
-                || (stream == ingot_runtime::stdio::STREAM_STDERR && want_err);
-            if keep {
-                lines.push((stream, data, time));
-            }
-        }
-    }
-    if !tail_all && lines.len() > tail_n {
-        lines.drain(..lines.len() - tail_n);
-    }
-
     let tty = record.config.Tty;
+    let hist: Vec<(u8, Vec<u8>)> = tokio::task::spawn_blocking(move || {
+        read_log_history(
+            &log_path, want_out, want_err, since, until, timestamps, tail_n, tail_all,
+        )
+    })
+    .await
+    .unwrap_or_default();
     let mut body_bytes: Vec<u8> = Vec::new();
-    for (stream, data, _time) in &lines {
+    for (stream, data) in &hist {
         if tty {
             body_bytes.extend_from_slice(data);
             if !data.ends_with(b"\n") {
@@ -1003,71 +972,78 @@ pub async fn top(
         "CMD".into(),
     ];
 
-    let procs_path = format!("/sys/fs/cgroup/ingot.slice/{}/cgroup.procs", record.id);
-    let mut pids = Vec::new();
-    if let Ok(content) = std::fs::read_to_string(&procs_path) {
-        for line in content.lines() {
-            if let Ok(p) = line.trim().parse::<i64>() {
-                pids.push(p);
-            }
-        }
-    }
-    if pids.is_empty() && st.pid > 0 {
-        pids.push(st.pid);
-    }
-
-    let mut processes = Vec::new();
-    for pid in pids {
-        let status_path = format!("/proc/{pid}/status");
-        let cmdline_path = format!("/proc/{pid}/cmdline");
-
-        let mut uid = "0".to_string();
-        let mut ppid = "0".to_string();
-
-        if let Ok(status_str) = std::fs::read_to_string(&status_path) {
-            for line in status_str.lines() {
-                if let Some(rest) = line.strip_prefix("Uid:") {
-                    if let Some(first_uid) = rest.split_whitespace().next() {
-                        uid = if first_uid == "0" {
-                            "root".into()
-                        } else {
-                            first_uid.to_string()
-                        };
-                    }
-                } else if let Some(rest) = line.strip_prefix("PPid:") {
-                    if let Some(first_ppid) = rest.split_whitespace().next() {
-                        ppid = first_ppid.to_string();
-                    }
+    let cid = record.id.clone();
+    let root_pid = st.pid;
+    // Off-executor: cgroup + /proc reads are blocking.
+    let processes: Vec<Vec<String>> = tokio::task::spawn_blocking(move || {
+        let procs_path = format!("/sys/fs/cgroup/ingot.slice/{cid}/cgroup.procs");
+        let mut pids = Vec::new();
+        if let Ok(content) = std::fs::read_to_string(&procs_path) {
+            for line in content.lines() {
+                if let Ok(p) = line.trim().parse::<i64>() {
+                    pids.push(p);
                 }
             }
         }
+        if pids.is_empty() && root_pid > 0 {
+            pids.push(root_pid);
+        }
+        let mut out = Vec::with_capacity(pids.len());
+        for pid in pids {
+            let status_path = format!("/proc/{pid}/status");
+            let cmdline_path = format!("/proc/{pid}/cmdline");
 
-        let cmd = if let Ok(cmd_bytes) = std::fs::read(&cmdline_path) {
-            let parts: Vec<&str> = cmd_bytes
-                .split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
-                .filter_map(|s| std::str::from_utf8(s).ok())
-                .collect();
-            if parts.is_empty() {
-                format!("[{pid}]")
-            } else {
-                parts.join(" ")
+            let mut uid = "0".to_string();
+            let mut ppid = "0".to_string();
+
+            if let Ok(status_str) = std::fs::read_to_string(&status_path) {
+                for line in status_str.lines() {
+                    if let Some(rest) = line.strip_prefix("Uid:") {
+                        if let Some(first_uid) = rest.split_whitespace().next() {
+                            uid = if first_uid == "0" {
+                                "root".into()
+                            } else {
+                                first_uid.to_string()
+                            };
+                        }
+                    } else if let Some(rest) = line.strip_prefix("PPid:") {
+                        if let Some(first_ppid) = rest.split_whitespace().next() {
+                            ppid = first_ppid.to_string();
+                        }
+                    }
+                }
             }
-        } else {
-            format!("[{pid}]")
-        };
 
-        processes.push(vec![
-            uid,
-            pid.to_string(),
-            ppid,
-            "0".to_string(),
-            "00:00".to_string(),
-            "?".to_string(),
-            "00:00:00".to_string(),
-            cmd,
-        ]);
-    }
+            let cmd = if let Ok(cmd_bytes) = std::fs::read(&cmdline_path) {
+                let parts: Vec<&str> = cmd_bytes
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| std::str::from_utf8(s).ok())
+                    .collect();
+                if parts.is_empty() {
+                    format!("[{pid}]")
+                } else {
+                    parts.join(" ")
+                }
+            } else {
+                format!("[{pid}]")
+            };
+
+            out.push(vec![
+                uid,
+                pid.to_string(),
+                ppid,
+                "0".to_string(),
+                "00:00".to_string(),
+                "?".to_string(),
+                "00:00:00".to_string(),
+                cmd,
+            ]);
+        }
+        out
+    })
+    .await
+    .unwrap_or_default();
 
     axum::Json(ContainerTopResponse { titles, processes }).into_response()
 }
@@ -1083,11 +1059,192 @@ pub struct StatsQuery {
         default
     )]
     pub one_shot: Option<bool>,
+    pub interval: Option<f64>,
 }
 
 /// Parse the RFC 3339 timestamps used in json-file log records.
 fn parse_log_time(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
     chrono::DateTime::parse_from_rfc3339(s).ok()
+}
+
+#[derive(serde::Deserialize)]
+struct LogEntry<'a> {
+    #[serde(default, borrow)]
+    log: &'a str,
+    #[serde(default, borrow)]
+    stream: &'a str,
+    #[serde(default, borrow)]
+    time: &'a str,
+}
+
+/// Blocking log history reader (run in spawn_blocking): typed parse,
+/// second-granularity since/until, ring-buffer tail. Fast path: when
+/// tail=N without since/until, reverse-scan the last bytes instead of
+/// parsing the whole file.
+#[allow(clippy::too_many_arguments)]
+fn read_log_history(
+    path: &std::path::Path,
+    want_out: bool,
+    want_err: bool,
+    since: Option<i64>,
+    until: Option<i64>,
+    timestamps: bool,
+    tail_n: usize,
+    tail_all: bool,
+) -> Vec<(u8, Vec<u8>)> {
+    use std::collections::VecDeque;
+    use std::io::{Read, Seek, SeekFrom};
+
+    fn parse_line(
+        line: &[u8],
+        want_out: bool,
+        want_err: bool,
+        since: Option<i64>,
+        until: Option<i64>,
+        timestamps: bool,
+    ) -> Option<(u8, Vec<u8>)> {
+        if line.is_empty() {
+            return None;
+        }
+        let e: LogEntry = serde_json::from_slice(line).ok()?;
+        let stream = if e.stream == "stderr" {
+            ingot_runtime::stdio::STREAM_STDERR
+        } else {
+            ingot_runtime::stdio::STREAM_STDOUT
+        };
+        let keep = (stream == ingot_runtime::stdio::STREAM_STDOUT && want_out)
+            || (stream == ingot_runtime::stdio::STREAM_STDERR && want_err);
+        if !keep {
+            return None;
+        }
+        // Timestamps are second-granularity (docker parity): parse once.
+        if since.is_some() || until.is_some() {
+            let ts = parse_log_time(e.time).map(|d| d.timestamp()).unwrap_or(0);
+            if since.is_some_and(|s| ts < s) {
+                return None;
+            }
+            if until.is_some_and(|u| ts > u) {
+                return None;
+            }
+        }
+        let data = if timestamps && !e.log.is_empty() {
+            let mut out = Vec::with_capacity(e.time.len() + 1 + e.log.len());
+            out.extend_from_slice(e.time.as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(e.log.as_bytes());
+            out
+        } else {
+            e.log.as_bytes().to_vec()
+        };
+        Some((stream, data))
+    }
+
+    // Fast path: tail=N, no time filters — read trailing bytes only.
+    if !tail_all && since.is_none() && until.is_none() && tail_n <= 5000 {
+        if let Ok(mut f) = std::fs::File::open(path) {
+            if let Ok(meta) = f.metadata() {
+                let size = meta.len();
+                if size > 0 {
+                    // Grab enough trailing bytes: assume ~300B/line avg,
+                    // grow until we have tail_n lines or hit whole file.
+                    let mut want: u64 =
+                        ((tail_n as u64 + 16) * 512).clamp(64 * 1024, 8 * 1024 * 1024);
+                    want = want.min(size);
+                    // If file is larger than want, scan backwards in chunks.
+                    let mut collected: Vec<(u8, Vec<u8>)> = Vec::new();
+                    let mut offset = size;
+                    let mut carry: Vec<u8> = Vec::new();
+                    while collected.len() < tail_n && offset > 0 {
+                        let chunk = want.min(offset).min(1024 * 1024);
+                        offset -= chunk;
+                        if f.seek(SeekFrom::Start(offset)).is_err() {
+                            break;
+                        }
+                        let mut tmp = vec![0u8; chunk as usize];
+                        if f.read_exact(&mut tmp).is_err() {
+                            break;
+                        }
+                        // Prepend carry (partial first line of next chunk).
+                        tmp.extend_from_slice(&carry);
+                        // Split into lines; first element may be partial
+                        // unless offset==0.
+                        let mut parts: Vec<&[u8]> = tmp.split(|&b| b == b'\n').collect();
+                        if offset > 0 {
+                            carry = parts.remove(0).to_vec();
+                        } else {
+                            carry.clear();
+                        }
+                        // Parse newest-first until we have enough.
+                        for line in parts.iter().rev() {
+                            if line.is_empty() {
+                                continue;
+                            }
+                            if let Some(e) =
+                                parse_line(line, want_out, want_err, None, None, timestamps)
+                            {
+                                collected.push(e);
+                                if collected.len() >= tail_n {
+                                    break;
+                                }
+                            }
+                        }
+                        // If we consumed the whole file, also try the carry.
+                        if offset == 0 && !carry.is_empty() && collected.len() < tail_n {
+                            if let Some(e) =
+                                parse_line(&carry, want_out, want_err, None, None, timestamps)
+                            {
+                                collected.push(e);
+                            }
+                            break;
+                        }
+                        // Grow window if lines are longer than assumed.
+                        if offset > 0 && collected.len() < tail_n {
+                            want = (want * 2).min(1024 * 1024);
+                        }
+                    }
+                    collected.reverse();
+                    return collected;
+                }
+            }
+        }
+        return Vec::new();
+    }
+
+    // General path: stream with BufReader, ring-buffer tail.
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    use std::io::BufRead;
+    let reader = std::io::BufReader::with_capacity(128 * 1024, file);
+    if tail_all {
+        let mut out = Vec::new();
+        for line in reader.split(b'\n') {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if let Some(e) = parse_line(&line, want_out, want_err, since, until, timestamps) {
+                out.push(e);
+            }
+        }
+        out
+    } else {
+        let mut ring: VecDeque<(u8, Vec<u8>)> = VecDeque::with_capacity(tail_n.min(10000));
+        for line in reader.split(b'\n') {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if let Some(e) = parse_line(&line, want_out, want_err, since, until, timestamps) {
+                if ring.len() >= tail_n {
+                    ring.pop_front();
+                }
+                ring.push_back(e);
+            }
+        }
+        ring.into_iter().collect()
+    }
 }
 
 fn sample_stats(
@@ -1102,24 +1259,30 @@ fn sample_stats(
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(0);
-    let limit = std::fs::read_to_string(slice_dir.join("memory.max"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            if let Ok(mem) = std::fs::read_to_string("/proc/meminfo") {
-                for line in mem.lines() {
-                    if let Some(rest) = line.strip_prefix("MemTotal:") {
-                        let kb = rest
-                            .trim()
-                            .trim_end_matches(" kB")
-                            .parse::<u64>()
-                            .unwrap_or(0);
+    static MEM_TOTAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let mem_total = *MEM_TOTAL.get_or_init(|| {
+        if let Ok(mem) = std::fs::read_to_string("/proc/meminfo") {
+            for line in mem.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    if let Ok(kb) = rest.trim().trim_end_matches(" kB").trim().parse::<u64>() {
                         return kb * 1024;
                     }
                 }
             }
-            1024 * 1024 * 1024
-        });
+        }
+        1024 * 1024 * 1024
+    });
+    let limit = std::fs::read_to_string(slice_dir.join("memory.max"))
+        .ok()
+        .and_then(|s| {
+            let s = s.trim();
+            if s == "max" {
+                None
+            } else {
+                s.parse::<u64>().ok()
+            }
+        })
+        .unwrap_or(mem_total);
 
     let pids_current = std::fs::read_to_string(slice_dir.join("pids.current"))
         .ok()
@@ -1155,9 +1318,12 @@ fn sample_stats(
         }
     }
 
-    let online_cpus = std::thread::available_parallelism()
-        .map(|n| n.get() as u64)
-        .unwrap_or(1);
+    static ONLINE_CPUS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let online_cpus = *ONLINE_CPUS.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get() as u64)
+            .unwrap_or(1)
+    });
 
     let total_usage = cpu_usec.saturating_mul(1000);
 
@@ -1166,27 +1332,35 @@ fn sample_stats(
         if let Ok(net_dev) = std::fs::read_to_string(format!("/proc/{pid}/net/dev")) {
             for line in net_dev.lines().skip(2) {
                 if let Some((iface, metrics)) = line.split_once(':') {
-                    let iface = iface.trim().to_string();
-                    if iface != "lo" {
-                        let cols: Vec<u64> = metrics
-                            .split_whitespace()
-                            .filter_map(|s| s.parse::<u64>().ok())
-                            .collect();
-                        if cols.len() >= 16 {
-                            networks.insert(
-                                iface,
-                                ingot_api::NetworkStats {
-                                    rx_bytes: cols[0],
-                                    rx_packets: cols[1],
-                                    rx_errors: cols[2],
-                                    rx_dropped: cols[3],
-                                    tx_bytes: cols[8],
-                                    tx_packets: cols[9],
-                                    tx_errors: cols[10],
-                                    tx_dropped: cols[11],
-                                },
-                            );
+                    let iface = iface.trim();
+                    if iface == "lo" || iface.is_empty() {
+                        continue;
+                    }
+                    // Parse first 12 cols without Vec alloc.
+                    let mut cols = [0u64; 12];
+                    let mut n = 0;
+                    for tok in metrics.split_whitespace() {
+                        if n >= 12 {
+                            break;
                         }
+                        cols[n] = tok.parse().unwrap_or(0);
+                        n += 1;
+                        // Need cols[0..4] + cols[8..12]; stop after 12.
+                    }
+                    if n >= 12 {
+                        networks.insert(
+                            iface.to_string(),
+                            ingot_api::NetworkStats {
+                                rx_bytes: cols[0],
+                                rx_packets: cols[1],
+                                rx_errors: cols[2],
+                                rx_dropped: cols[3],
+                                tx_bytes: cols[8],
+                                tx_packets: cols[9],
+                                tx_errors: cols[10],
+                                tx_dropped: cols[11],
+                            },
+                        );
                     }
                 }
             }
@@ -1261,24 +1435,50 @@ pub async fn stats(
     };
 
     let stream_mode = q.stream.unwrap_or(true) && !q.one_shot.unwrap_or(false);
+    let interval = q.interval.unwrap_or(1.0).clamp(0.1, 10.0);
 
     if !stream_mode {
-        let stats = sample_stats(&cid, &cname, pid, None);
+        let cid2 = cid.clone();
+        let cname2 = cname.clone();
+        let stats = tokio::task::spawn_blocking(move || sample_stats(&cid2, &cname2, pid, None))
+            .await
+            .unwrap_or_else(|_| sample_stats(&cid, &cname, pid, None));
         return axum::Json(stats).into_response();
     }
 
+    // Refresh pid per tick (stale after restart) via weak handle; run
+    // blocking cgroup reads off the executor.
+    let handle_w = std::sync::Arc::downgrade(&handle);
     let stream = futures::stream::unfold(
-        (None::<ingot_api::ContainerStats>, cid, cname, pid),
-        |(prev_sample, cid, cname, pid)| async move {
-            let cur = sample_stats(&cid, &cname, pid, prev_sample.as_ref());
+        (
+            None::<ingot_api::ContainerStats>,
+            cid,
+            cname,
+            pid,
+            handle_w,
+            interval,
+        ),
+        |(prev_sample, cid, cname, last_pid, handle_w, interval)| async move {
+            let pid = handle_w
+                .upgrade()
+                .map(|h| h.state.lock().unwrap().pid)
+                .unwrap_or(last_pid);
+            let cid2 = cid.clone();
+            let cname2 = cname.clone();
+            let prev2 = prev_sample.clone();
+            let cur = tokio::task::spawn_blocking(move || {
+                sample_stats(&cid2, &cname2, pid, prev2.as_ref())
+            })
+            .await
+            .unwrap_or_else(|_| sample_stats(&cid, &cname, pid, prev_sample.as_ref()));
             let next_prev = Some(cur.clone());
             let json_bytes = serde_json::to_vec(&cur).unwrap_or_default();
             let mut chunk = json_bytes;
             chunk.push(b'\n');
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(std::time::Duration::from_secs_f64(interval)).await;
             Some((
                 Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)),
-                (next_prev, cid, cname, pid),
+                (next_prev, cid, cname, pid, handle_w, interval),
             ))
         },
     );

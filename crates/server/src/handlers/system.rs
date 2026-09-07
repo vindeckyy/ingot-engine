@@ -61,6 +61,7 @@ pub async fn version(State(_state): State<SharedState>) -> Response {
     axum::Json(v).into_response()
 }
 
+#[derive(Clone)]
 struct HostCapabilities {
     cgroup_v2: bool,
     memory_limit: bool,
@@ -79,7 +80,33 @@ struct HostCapabilities {
     warnings: Vec<String>,
 }
 
+static HOST_CAPS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<(std::time::Instant, HostCapabilities)>,
+> = std::sync::OnceLock::new();
+
+fn cached_host_capabilities() -> HostCapabilities {
+    let cell = HOST_CAPS_CACHE.get_or_init(|| {
+        std::sync::Mutex::new((
+            std::time::Instant::now() - std::time::Duration::from_secs(10),
+            host_caps_inner(),
+        ))
+    });
+    {
+        let guard = cell.lock().unwrap();
+        if guard.0.elapsed() < std::time::Duration::from_secs(5) {
+            return guard.1.clone();
+        }
+    }
+    let fresh = host_caps_inner();
+    *cell.lock().unwrap() = (std::time::Instant::now(), fresh.clone());
+    fresh
+}
+
 fn detect_host_capabilities() -> HostCapabilities {
+    cached_host_capabilities()
+}
+
+fn host_caps_inner() -> HostCapabilities {
     let controllers =
         std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").unwrap_or_default();
     let controller_list: Vec<&str> = controllers.split_whitespace().collect();
@@ -409,14 +436,22 @@ async fn census(state: &SharedState) -> (i64, i64, i64, i64) {
 }
 
 fn daemon_id(state: &SharedState) -> String {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<String> = OnceLock::new();
+    if let Some(id) = CACHED.get() {
+        return id.clone();
+    }
     // Stable per data-root id.
     let path = state.paths.root.join("engine-id");
     if let Ok(id) = std::fs::read_to_string(&path) {
-        return id.trim().to_string();
+        let id = id.trim().to_string();
+        let _ = CACHED.set(id.clone());
+        return id;
     }
     let id = ingot_util::new_id();
     let _ = std::fs::create_dir_all(&state.paths.root);
     let _ = std::fs::write(&path, &id);
+    let _ = CACHED.set(id.clone());
     id
 }
 

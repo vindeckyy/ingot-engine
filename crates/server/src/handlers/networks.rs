@@ -152,14 +152,21 @@ pub async fn create(State(state): State<SharedState>, body: axum::body::Bytes) -
         )
         .await
     {
-        Ok(rec) => (
-            StatusCode::CREATED,
-            axum::Json(NetworkCreateResponse {
-                Id: rec.id,
-                Warning: String::new(),
-            }),
-        )
-            .into_response(),
+        Ok(rec) => {
+            let mut attrs = HashMap::new();
+            attrs.insert("name".to_string(), rec.name.clone());
+            state.events.publish(ingot_api::EventMessage::new(
+                "network", "create", &rec.id, attrs,
+            ));
+            (
+                StatusCode::CREATED,
+                axum::Json(NetworkCreateResponse {
+                    Id: rec.id,
+                    Warning: String::new(),
+                }),
+            )
+                .into_response()
+        }
         // Validation failures are client errors (400); name/subnet
         // conflicts are 409. create_network phrases validation as
         // "invalid ..." by convention.
@@ -201,7 +208,14 @@ pub async fn remove(State(state): State<SharedState>, Path(id): Path<String>) ->
         );
     }
     match mgr.remove_network(&id).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            let mut attrs = HashMap::new();
+            attrs.insert("name".to_string(), n.name.clone());
+            state.events.publish(ingot_api::EventMessage::new(
+                "network", "destroy", &n.id, attrs,
+            ));
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => not_found(format!("{e:#}")),
     }
 }
@@ -334,6 +348,12 @@ pub async fn connect(
                 &state.paths.container_config(&record.id),
                 &*handle.record.lock().unwrap(),
             );
+            let mut attrs = HashMap::new();
+            attrs.insert("name".to_string(), n.name.clone());
+            attrs.insert("container".to_string(), record.id.clone());
+            state.events.publish(ingot_api::EventMessage::new(
+                "network", "connect", &n.id, attrs,
+            ));
             StatusCode::OK.into_response()
         }
         Err(e) => server_error(format!("{e:#}")),
@@ -390,6 +410,15 @@ pub async fn disconnect(
     // affects this network; surviving endpoints keep their own
     // registrations untouched.
     netmgr.detach(&n.id, &ep.ip, &rid, &keys).await;
+    let mut attrs = HashMap::new();
+    attrs.insert("name".to_string(), n.name.clone());
+    attrs.insert("container".to_string(), rid.clone());
+    state.events.publish(ingot_api::EventMessage::new(
+        "network",
+        "disconnect",
+        &n.id,
+        attrs,
+    ));
     StatusCode::OK.into_response()
 }
 

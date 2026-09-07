@@ -153,6 +153,7 @@ pub struct HostConfig {
     pub Isolation: String,
     pub CpuShares: i64,
     pub Memory: i64,
+    pub MemorySwap: i64,
     pub NanoCpus: i64,
     pub CgroupParent: String,
     pub BlkioWeight: u16,

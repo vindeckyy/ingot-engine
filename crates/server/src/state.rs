@@ -87,7 +87,7 @@ impl DaemonState {
         let images = Arc::new(ingot_image::ImageStore::new(paths.clone())?);
         Ok(DaemonState {
             paths,
-            events: EventBus::new(4096),
+            events: EventBus::new(256),
             config,
             started_at: chrono::Utc::now(),
             event_listeners: AtomicI64::new(0),

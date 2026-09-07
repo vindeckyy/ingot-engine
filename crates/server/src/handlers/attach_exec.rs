@@ -192,14 +192,21 @@ fn read_log_frames(
     want_out: bool,
     want_err: bool,
 ) -> Vec<u8> {
+    #[derive(serde::Deserialize)]
+    struct E<'a> {
+        #[serde(default, borrow)]
+        log: &'a str,
+        #[serde(default, borrow)]
+        stream: &'a str,
+    }
     let raw = std::fs::read(log_path).unwrap_or_default();
     let mut out = Vec::new();
     for line in raw.split(|&b| b == b'\n') {
         if line.is_empty() {
             continue;
         }
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
-            let stream = if v["stream"] == "stderr" {
+        if let Ok(e) = serde_json::from_slice::<E>(line) {
+            let stream = if e.stream == "stderr" {
                 STREAM_STDERR
             } else {
                 STREAM_STDOUT
@@ -209,7 +216,7 @@ fn read_log_frames(
             if !keep {
                 continue;
             }
-            let data = v["log"].as_str().unwrap_or("").as_bytes();
+            let data = e.log.as_bytes();
             if tty {
                 out.extend_from_slice(data);
             } else {

@@ -5,9 +5,9 @@ use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
-use ingot_api::EventMessage;
+use ingot_api::{parse_filters, EventMessage};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
@@ -35,7 +35,15 @@ pub async fn events(State(state): State<SharedState>, Query(q): Query<EventsQuer
     };
     state.event_listeners.fetch_add(1, Ordering::Relaxed);
     let rx = state.events.subscribe();
-    let stream = event_stream(rx, filter);
+    // Decrement on disconnect (previously leaked monotonically).
+    struct Guard(std::sync::Arc<crate::state::DaemonState>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.event_listeners.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let guard = Guard(state.clone());
+    let stream = event_stream(rx, filter, guard);
     let body = Body::from_stream(stream);
     Response::builder()
         .status(StatusCode::OK)
@@ -48,35 +56,37 @@ pub async fn events(State(state): State<SharedState>, Query(q): Query<EventsQuer
 fn event_stream(
     rx: tokio::sync::broadcast::Receiver<EventMessage>,
     filter: EventFilter,
+    _guard: impl Send + 'static,
 ) -> impl futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static {
-    futures::stream::unfold((rx, filter), |(mut rx, filter)| async move {
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    if filter.until.is_some_and(|u| ev.time > u) {
-                        return None;
+    futures::stream::unfold(
+        (rx, filter, Some(_guard)),
+        |(mut rx, filter, guard)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if filter.until.is_some_and(|u| ev.time > u) {
+                            return None;
+                        }
+                        if !matches_filter(&ev, &filter) {
+                            continue;
+                        }
+                        // Compact vec (no intermediate String) per event.
+                        let mut buf = serde_json::to_vec(&ev).unwrap_or_default();
+                        buf.push(b'\n');
+                        return Some((Ok(axum::body::Bytes::from(buf)), (rx, filter, guard)));
                     }
-                    if !matches_filter(&ev, &filter) {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Back off instead of tight-spin when producer outruns us.
+                        tokio::task::yield_now().await;
                         continue;
                     }
-                    let mut line = serde_json::to_string(&ev).unwrap_or_default();
-                    line.push('\n');
-                    return Some((Ok(axum::body::Bytes::from(line)), (rx, filter)));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    return None;
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return None;
+                    }
                 }
             }
-        }
-    })
-}
-
-/// Filter parsing helper shared by list endpoints: `{"dangling":["true"]}`.
-pub fn parse_filters(raw: &Option<String>) -> HashMap<String, Vec<String>> {
-    raw.as_deref()
-        .map(|s| serde_json::from_str(s).unwrap_or_default())
-        .unwrap_or_default()
+        },
+    )
 }
 
 #[allow(clippy::result_large_err)]
@@ -152,6 +162,7 @@ fn matches_filter(ev: &EventMessage, f: &EventFilter) -> bool {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::collections::HashMap;
 
     fn ev(typ: &str, action: &str, label: Option<(&str, &str)>) -> EventMessage {
         let mut attrs = HashMap::new();
@@ -245,7 +256,8 @@ mod tests {
         filter.types.insert("container".to_string());
         filter.until = Some(i64::MAX);
 
-        let stream = event_stream(rx1, filter);
+        struct Noop;
+        let stream = event_stream(rx1, filter, Noop);
         tokio::pin!(stream);
 
         tx.send(EventMessage::new(

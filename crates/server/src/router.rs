@@ -85,6 +85,7 @@ fn api_routes() -> Router<SharedState> {
         .route("/images/{name}/json", get(handlers::images::inspect))
         .route("/images/{name}/history", get(handlers::images::history))
         .route("/images/{name}/tag", post(handlers::images::tag))
+        .route("/images/{name}/push", post(handlers::images::push))
         .route("/images/{name}", delete(handlers::images::remove))
         // networks (M3)
         .route("/networks", get(handlers::networks::list))
@@ -113,13 +114,32 @@ fn api_routes() -> Router<SharedState> {
 }
 
 pub fn build_router(state: SharedState) -> Router {
-    Router::new()
-        .merge(api_routes())
-        .nest("/v1.44", api_routes())
+    // Build once, clone for bare + versioned mounts. A prefix-stripping
+    // middleware cannot work: axum layers run after routing, so versioned
+    // nesting stays explicit. Every minor from MIN_API_VERSION to
+    // API_VERSION is served (the CLI always picks min(its max, our
+    // advertised 1.44)); anything else falls through to the 501 fallback.
+    let routes = api_routes();
+    let mut router = Router::new().merge(routes.clone());
+    for minor in supported_minors() {
+        router = router.nest(&format!("/v1.{minor}"), routes.clone());
+    }
+    router
         .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(axum::middleware::from_fn(trace_requests))
         .fallback(handlers::not_implemented_fallback)
         .with_state(state)
+}
+
+/// Served version minors, derived from the advertised constants so the
+/// router can never drift from `/version` (unit 1.4).
+fn supported_minors() -> std::ops::RangeInclusive<u32> {
+    fn minor(v: &str) -> u32 {
+        v.split_once('.')
+            .and_then(|(_, m)| m.parse().ok())
+            .unwrap_or(44)
+    }
+    minor(ingot_api::MIN_API_VERSION)..=minor(ingot_api::API_VERSION)
 }
 
 /// Per-request span (Plan Phase 0, unit 0.3): method + path + status +
@@ -131,8 +151,13 @@ async fn trace_requests(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use tracing::Instrument;
+    // Fast path: skip span+alloc for hot polls (ping, stats polling).
+    let path = req.uri().path();
+    if path == "/_ping" || path.ends_with("/_ping") {
+        return next.run(req).await;
+    }
     let method = req.method().clone();
-    let path = req.uri().path().to_string();
+    let path = path.to_string();
     let span = tracing::info_span!("engine_api", %method, path = %path);
     let start = std::time::Instant::now();
     let resp = next.run(req).instrument(span).await;
@@ -186,16 +211,20 @@ mod tests {
     #[tokio::test]
     async fn version_prefix_parity() {
         let state = test_state("prefix");
-        let router = build_router(state.clone());
-        let (s, _, text) = get(router, "/v1.44/_ping").await;
-        assert_eq!(s, StatusCode::OK, "ping on v1.44");
-        assert_eq!(text, "OK");
+        // Every served minor answers ping + version identically (unit 1.4);
+        // the advertised constants always agree with the router.
+        for minor in super::supported_minors() {
+            let uri = format!("/v1.{minor}/_ping");
+            let (s, _, text) = get(build_router(state.clone()), &uri).await;
+            assert_eq!(s, StatusCode::OK, "ping on {uri}");
+            assert_eq!(text, "OK");
 
-        let router = build_router(state.clone());
-        let (s, v, _) = get(router, "/v1.44/version").await;
-        assert_eq!(s, StatusCode::OK, "version on v1.44");
-        assert_eq!(v["ApiVersion"], ingot_api::API_VERSION);
-        assert_eq!(v["MinAPIVersion"], ingot_api::MIN_API_VERSION);
+            let uri = format!("/v1.{minor}/version");
+            let (s, v, _) = get(build_router(state.clone()), &uri).await;
+            assert_eq!(s, StatusCode::OK, "version on {uri}");
+            assert_eq!(v["ApiVersion"], ingot_api::API_VERSION);
+            assert_eq!(v["MinAPIVersion"], ingot_api::MIN_API_VERSION);
+        }
 
         // Bare paths keep working too.
         let (s, _, text) = get(build_router(state.clone()), "/_ping").await;
@@ -210,7 +239,10 @@ mod tests {
             "/v1.44/plugins/list",
             "/v1.30/swarm/xxx",
             "/nope",
-            "/v1.24/version",
+            // Outside the served range (below min / above max).
+            "/v1.23/version",
+            "/v1.45/version",
+            "/v2/version",
         ] {
             let (s, v, _) = get(build_router(state.clone()), uri).await;
             assert_eq!(s, StatusCode::NOT_IMPLEMENTED, "{uri}");

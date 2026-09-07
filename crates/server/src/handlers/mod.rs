@@ -62,8 +62,10 @@ pub async fn stream_body_to_temp_file(
     use futures::StreamExt;
     use std::io::Write;
 
-    let mut named_temp = tempfile::NamedTempFile::new()
+    let named_temp = tempfile::NamedTempFile::new()
         .map_err(|e| server_error(format!("create temp file: {e}")))?;
+    // BufWriter 256KB: avoids a write(2) per body chunk.
+    let mut writer = std::io::BufWriter::with_capacity(256 * 1024, named_temp);
     let mut total_bytes: u64 = 0;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
@@ -78,14 +80,16 @@ pub async fn stream_body_to_temp_file(
                 format!("request body exceeded size limit of {max_bytes} bytes"),
             ));
         }
-        if let Err(e) = named_temp.write_all(&chunk) {
+        if let Err(e) = writer.write_all(&chunk) {
             return Err(server_error(format!("write temp file: {e}")));
         }
     }
-    if let Err(e) = named_temp.flush() {
+    if let Err(e) = writer.flush() {
         return Err(server_error(format!("flush temp file: {e}")));
     }
-    Ok(named_temp)
+    writer
+        .into_inner()
+        .map_err(|e| server_error(format!("flush temp file: {e}")))
 }
 
 #[cfg(test)]

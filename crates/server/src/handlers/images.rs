@@ -69,9 +69,66 @@ pub async fn create(
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressMessage>(64);
     let client = state.registry.clone();
     let store = state.images.clone();
+    let events = state.events.clone();
+    let pull_name = spec.clone();
+    tokio::spawn(async move {
+        match ingot_image::pull::pull(client, store, image_ref, auth, platform, tx.clone()).await {
+            Ok(id) => {
+                let mut attrs = std::collections::HashMap::new();
+                attrs.insert("name".to_string(), pull_name);
+                events.publish(ingot_api::EventMessage::new("image", "pull", &id, attrs));
+            }
+            Err(e) => {
+                let _ = tx.send(ProgressMessage::error(format!("{e:#}"))).await;
+            }
+        }
+    });
+
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|msg| {
+            let mut line = serde_json::to_string(&msg).unwrap_or_default();
+            line.push('\n');
+            (Ok::<_, std::io::Error>(axum::body::Bytes::from(line)), rx)
+        })
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// POST /images/{name}/push — the push endpoint. Streams newline JSON
+/// progress, mirroring [`create`]: the name resolves against the local
+/// store (tag or digest), credentials pass through untouched, and the
+/// registry push runs on a background task.
+pub async fn push(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Query(q): Query<PushParams>,
+    headers: HeaderMap,
+) -> Response {
+    let spec = assemble_push_spec(&name, q.tag.as_deref());
+    let target = match ImageRef::parse(&spec) {
+        Ok(r) => r,
+        Err(e) => return bad_request(e),
+    };
+    let id = match state.images.resolve(&spec).await {
+        Ok(id) => id,
+        Err(e) => return not_found(e),
+    };
+    let record = match state.images.load(&id).await {
+        Ok(Some(r)) => r,
+        _ => return not_found(format!("No such image: {name}")),
+    };
+
+    let auth = decode_auth_header(&headers);
+    let (tx, rx) = tokio::sync::mpsc::channel::<ProgressMessage>(64);
+    let client = state.registry.clone();
+    let store = state.images.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            ingot_image::pull::pull(client, store, image_ref, auth, platform, tx.clone()).await
+            ingot_image::push::push(client, store, target, record, auth, tx.clone()).await
         {
             let _ = tx.send(ProgressMessage::error(format!("{e:#}"))).await;
         }
@@ -89,6 +146,34 @@ pub async fn create(
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+/// Reassemble the CLI's split push reference: the path carries the repo
+/// (possibly registry-qualified) while the tag query carries the tag.
+/// Only the last segment decides: a colon in an earlier segment is a
+/// registry port (`host:5000/repo`), not a tag.
+fn assemble_push_spec(name: &str, tag: Option<&str>) -> String {
+    let Some(t) = tag else {
+        return name.to_string();
+    };
+    if t.is_empty() || name.contains('@') {
+        return name.to_string();
+    }
+    if t.starts_with("sha256:") {
+        return format!("{name}@{t}");
+    }
+    let last = name.rsplit('/').next().unwrap_or(name);
+    if last.contains(':') {
+        name.to_string()
+    } else {
+        format!("{name}:{t}")
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+pub struct PushParams {
+    tag: Option<String>,
 }
 
 /// Reassemble the CLI's split pull reference: fromImage carries the repo
@@ -459,7 +544,14 @@ pub async fn tag(
         _ => return bad_request("repo parameter required"),
     };
     match state.images.tag(&id, &tag_key).await {
-        Ok(()) => StatusCode::CREATED.into_response(),
+        Ok(()) => {
+            let mut attrs = std::collections::HashMap::new();
+            attrs.insert("name".to_string(), tag_key);
+            state
+                .events
+                .publish(ingot_api::EventMessage::new("image", "tag", &id, attrs));
+            StatusCode::CREATED.into_response()
+        }
         Err(e) => server_error(e),
     }
 }
@@ -499,10 +591,19 @@ pub async fn remove(
     };
     if let Some(t) = untag_only {
         match state.images.remove_image(&id, Some(&t)).await {
-            Ok(_) => events.push(ImageDeleteResponseItem {
-                Untagged: t,
-                Deleted: String::new(),
-            }),
+            Ok(_) => {
+                events.push(ImageDeleteResponseItem {
+                    Untagged: t.clone(),
+                    Deleted: String::new(),
+                });
+                let ev = ingot_api::EventMessage::new(
+                    "image",
+                    "untag",
+                    &id,
+                    [("name".to_string(), t)].into_iter().collect(),
+                );
+                state.events.publish(ev);
+            }
             Err(e) => return server_error(e),
         }
         return axum::Json(events).into_response();
@@ -1045,6 +1146,39 @@ mod tests {
         // Already-pinned spec is complete; a stray tag is ignored.
         assert_eq!(
             assemble_pull_spec("busybox@sha256:abc", "latest"),
+            "busybox@sha256:abc"
+        );
+    }
+
+    #[test]
+    fn push_spec_assembly() {
+        assert_eq!(
+            assemble_push_spec("busybox", Some("latest")),
+            "busybox:latest"
+        );
+        assert_eq!(assemble_push_spec("busybox", None), "busybox");
+        assert_eq!(assemble_push_spec("busybox", Some("")), "busybox");
+        // A tag already on the name wins over the query.
+        assert_eq!(
+            assemble_push_spec("busybox:1.36", Some("other")),
+            "busybox:1.36"
+        );
+        // A colon in the registry host is a port, not a tag.
+        assert_eq!(
+            assemble_push_spec("127.0.0.1:5000/team/app", Some("dev")),
+            "127.0.0.1:5000/team/app:dev"
+        );
+        assert_eq!(
+            assemble_push_spec("127.0.0.1:5000/team/app:dev", Some("other")),
+            "127.0.0.1:5000/team/app:dev"
+        );
+        // Digest-looking query pieces join with '@'; pinned specs are whole.
+        assert_eq!(
+            assemble_push_spec("busybox", Some("sha256:abc")),
+            "busybox@sha256:abc"
+        );
+        assert_eq!(
+            assemble_push_spec("busybox@sha256:abc", Some("latest")),
             "busybox@sha256:abc"
         );
     }

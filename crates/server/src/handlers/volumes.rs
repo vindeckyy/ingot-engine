@@ -159,7 +159,14 @@ pub async fn create(State(state): State<SharedState>, body: axum::body::Bytes) -
         Some(body.Driver.as_str())
     };
     match vm.create(name, driver, body.Labels, body.DriverOpts) {
-        Ok(vol) => (StatusCode::CREATED, axum::Json(vol)).into_response(),
+        Ok(vol) => {
+            let mut attrs = HashMap::new();
+            attrs.insert("name".to_string(), vol.Name.clone());
+            state.events.publish(ingot_api::EventMessage::new(
+                "volume", "create", &vol.Name, attrs,
+            ));
+            (StatusCode::CREATED, axum::Json(vol)).into_response()
+        }
         Err(e) => bad_request(format!("create volume: {e}")),
     }
 }
@@ -184,7 +191,14 @@ pub async fn remove(State(state): State<SharedState>, Path(name): Path<String>) 
     }
     let vm = get_vm(&state);
     match vm.remove(&name) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            let mut attrs = HashMap::new();
+            attrs.insert("name".to_string(), name.clone());
+            state.events.publish(ingot_api::EventMessage::new(
+                "volume", "destroy", &name, attrs,
+            ));
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => {
             if e.to_string().contains("no such volume") {
                 not_found(format!("no such volume: {name}"))
