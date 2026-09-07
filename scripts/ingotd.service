@@ -1,0 +1,20 @@
+[Unit]
+Description=Ingot Container Engine Daemon
+Documentation=https://github.com/vindeckyy/ingot-engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ingotd
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+# Daemon runs as root (namespace/cgroup/mount setup requires it).
+# Restrict socket access to the docker group if you create one.
+# Socket: /run/ingot/ingot.sock
+# State:  /var/lib/ingot
+
+[Install]
+WantedBy=multi-user.target

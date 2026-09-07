@@ -229,6 +229,11 @@ enum Cmd {
         #[command(subcommand)]
         action: SystemSubcmd,
     },
+    /// Generate shell completions
+    Completions {
+        /// Shell type (bash, zsh, fish, elvish, powershell)
+        shell: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -370,6 +375,12 @@ pub struct RunOpts {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // completions doesn't need a daemon connection.
+    if let Cmd::Completions { shell } = &cli.cmd {
+        return print_completions(shell);
+    }
+
     let socket = match &cli.host {
         Some(h) => std::path::PathBuf::from(h.trim_start_matches("unix://")),
         None => client::default_socket(),
@@ -546,5 +557,24 @@ async fn main() -> Result<()> {
             SystemSubcmd::Df => commands::system_df(&api).await,
             SystemSubcmd::Prune { force } => commands::system_prune(&api, force).await,
         },
+        Cmd::Completions { .. } => unreachable!(),
     }
+}
+
+fn print_completions(shell: &str) -> Result<()> {
+    use clap::CommandFactory;
+    use clap_complete::{generate, Shell};
+    let shell_kind = match shell.to_lowercase().as_str() {
+        "bash" => Shell::Bash,
+        "zsh" => Shell::Zsh,
+        "fish" => Shell::Fish,
+        "elvish" => Shell::Elvish,
+        "powershell" | "powershell.exe" => Shell::PowerShell,
+        other => anyhow::bail!(
+            "unknown shell '{other}': expected bash, zsh, fish, elvish, or powershell"
+        ),
+    };
+    let mut cmd = Cli::command();
+    generate(shell_kind, &mut cmd, "ingot", &mut std::io::stdout());
+    Ok(())
 }

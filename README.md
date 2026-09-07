@@ -234,6 +234,64 @@ All persistent state lives under `/var/lib/ingot` by default. Runtime state (soc
 - **Tools:** `iptables`, `iproute2` (`ip`), `curl`, `rustc` / `cargo` (1.96+).
 - **Permissions:** Root (required for namespaces, overlayfs mounts, iptables, bridge creation).
 
+### Installation
+
+#### From source (release build)
+
+```bash
+git clone https://github.com/vindeckyy/ingot-engine.git
+cd ingot-engine
+make install
+```
+
+This builds release binaries and installs them to `/usr/local/bin`. It also installs the systemd unit and shell completions if the directories exist.
+
+To install to a different prefix:
+
+```bash
+make install PREFIX=/opt/ingot
+```
+
+#### From source (debug build)
+
+```bash
+git clone https://github.com/vindeckyy/ingot-engine.git
+cd ingot-engine
+./scripts/install.sh --debug
+```
+
+#### Manual build
+
+```bash
+cargo build --release -p ingotd -p ingot-cli
+sudo install -m 0755 target/release/ingotd /usr/local/bin/
+sudo install -m 0755 target/release/ingot  /usr/local/bin/
+```
+
+### Shell Completions
+
+```bash
+ingot completions bash > /etc/bash_completion.d/ingot
+ingot completions zsh  > /usr/share/zsh/site-functions/_ingot
+ingot completions fish > ~/.config/fish/completions/ingot.fish
+```
+
+Or use the Makefile target:
+
+```bash
+make completions
+```
+
+### systemd Service
+
+The install script copies `scripts/ingotd.service` to `/etc/systemd/system/`. To enable and start:
+
+```bash
+sudo systemctl enable --now ingotd
+```
+
+The service runs `ingotd` with default settings. Edit the unit file to pass custom flags (`--data-root`, `--bridge`, etc.).
+
 ### Build
 
 ```bash
@@ -608,6 +666,7 @@ The Compose engine resolves service dependencies, creates dedicated bridge netwo
 | `network` | Manage networks (`ls`, `create`, `rm`, `inspect`, `connect`, `disconnect`, `prune`) |
 | `volume` | Manage volumes (`ls`, `create`, `rm`, `inspect`, `prune`) |
 | `system` | System commands (`df`, `prune`) |
+| `completions` | Generate shell completions (`bash`, `zsh`, `fish`, `elvish`, `powershell`) |
 
 ### `run` Flags
 
