@@ -401,6 +401,28 @@ The daemon accepts the following flags:
 | `--debug` | off | Verbose logging |
 | `--fsck` | off | Read-only image store consistency check |
 | `--repair` | off | Reclaim stale partial downloads and unreferenced blobs |
+| `--socket-group` | unset (mode 0600 root-only) | Group owner for the Unix socket |
+| `--config` | unset | Path to a JSON config file (see below) |
+
+### Config File
+
+`ingotd --config /etc/ingot/daemon.json` reads the same knobs from a JSON
+file (docker's `daemon.json` equivalent). Keys use the flag names:
+
+```json
+{
+  "data-root": "/var/lib/ingot",
+  "run-root": "/run/ingot",
+  "socket": "/run/ingot/ingot.sock",
+  "bridge": "ingot0",
+  "debug": false,
+  "socket-group": "ingot"
+}
+```
+
+Precedence is CLI flag > config file > built-in default, per key. Unknown
+keys, unreadable files, and malformed JSON fail the boot with an actionable
+error naming the file — a typo never silently falls back to a default.
 
 ### Boot Checks
 
@@ -676,6 +698,71 @@ services:
 ```
 
 The Compose engine resolves service dependencies, creates dedicated bridge networks, creates named volumes, and manages startup and shutdown ordering.
+
+### Profiles
+
+Services with `profiles` are skipped unless one of their profiles is active via repeatable `--profile` flags or the comma-separated `COMPOSE_PROFILES` environment variable. Profile-less services always start. `compose ps` prints the active profiles.
+
+```yaml
+services:
+  web:
+    image: busybox:latest
+  debug:
+    image: busybox:latest
+    profiles: [tools]
+```
+
+```bash
+./target/debug/ingot compose -f compose.yaml up -d --profile tools
+COMPOSE_PROFILES=tools ./target/debug/ingot compose -f compose.yaml ps
+```
+
+### Extends
+
+Services inherit from a base service in a local file (`file` + `service` keys) or in the same file (`service` only). The base is shallow-merged under the override: each key set in the override wins whole, unset keys fall back to the base. Remote URLs are rejected (local files only, resolved relative to the composing file).
+
+```yaml
+services:
+  web:
+    extends:
+      file: base.yaml
+      service: app
+    image: busybox:2.0
+```
+
+### Deploy resources
+
+`deploy.resources.limits` maps onto the container create fields (`cpus` to `NanoCpus`, `memory` to `Memory`; accepts numbers or strings like `"0.50"` / `"512M"`). Invalid values fail `up` with an error naming the field. `reservations` are accepted but advisory: validated, never applied.
+
+```yaml
+services:
+  web:
+    image: busybox:latest
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+        reservations:
+          memory: 256M
+```
+
+### Configs and secrets
+
+Short (`- name`) and long (`- source:`/`target:`) syntax are supported. Top-level entries with a `file:` source are mounted read-only into the container (`/run/secrets/<target>` for secrets, `/<target>` for configs) via the existing bind-mount flow. Long-syntax `uid`/`gid`/`mode` are accepted but advisory (bind mounts expose no ownership knobs). Entries without a `file:` source (`environment:`, `external:`) fail per service with an explicit 501-style reason: the daemon has no runtime secret store (`POST /secrets` stages build secrets only).
+
+```yaml
+services:
+  web:
+    image: busybox:latest
+    secrets:
+      - db-pass
+      - source: db-pass
+        target: custom
+secrets:
+  db-pass:
+    file: ./db-pass.txt
+```
 
 ## CLI Reference
 

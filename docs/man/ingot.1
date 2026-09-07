@@ -1,0 +1,134 @@
+.TH INGOT 1 "2026-09-07" "ingot 0.1.0" "User Commands"
+.SH NAME
+ingot \- Docker-compatible container engine client
+.SH SYNOPSIS
+.B ingot
+[\fIOPTIONS\fR] \fICOMMAND\fR [\fIARGS\fR]
+.SH DESCRIPTION
+.B ingot
+is the command-line client for the Ingot container engine. It talks to the
+.BR ingotd (1)
+daemon over a Unix socket (default
+.IR /run/ingot/ingot.sock ).
+Per-command help is authoritative:
+.B "ingot \fICOMMAND\fR \-\-help"
+lists the exact flags.
+.SH OPTIONS
+.TP
+.BR \-\-host " \fIHOST\fR"
+Daemon socket (e.g. \fIunix:///run/ingot/ingot.sock\fR).
+.TP
+.BR \-h ", " \-\-help
+Print help.
+.TP
+.BR \-V ", " \-\-version
+Print version.
+.SH COMMANDS
+.TP
+.B version\fR, \fBping\fR, \fBinfo
+Daemon reachability and version information.
+.TP
+.B run
+Run a command in a new container. Supports
+.BR \-d ,
+.BR \-i ,
+.BR \-t ,
+.BR \-\-name ,
+.BR \-p / \-\-publish ,
+.BR \-e / \-\-env ,
+.BR \-v / \-\-volume ,
+.BR \-\-network ,
+.BR \-\-rm ,
+.BR \-w / \-\-workdir ,
+.BR \-\-dns ", " \-\-dns\-search ", " \-\-dns\-opt ,
+.BR \-\-restart ,
+.BR \-\-memory ,
+.BR \-\-cpus ,
+.BR \-\-pids\-limit ,
+.BR \-\-cap\-add ", " \-\-cap\-drop ,
+.BR \-\-privileged ,
+.BR \-\-user .
+.TP
+.B pull
+Pull an image from a registry (digest pinning and platform selection
+supported).
+.TP
+.B login\fR, \fBlogout
+Store or remove registry credentials (mode 0600).
+.TP
+.B ps
+List containers:
+.BR \-a ,
+.BR \-q ,
+.BR \-\-no\-trunc ,
+.BR \-\-format " table|json" ,
+.BR \-f .
+.TP
+.B images
+List images:
+.BR \-q ,
+.BR \-\-no\-trunc ,
+.BR \-\-format " table|json" ,
+.BR \-f .
+.TP
+.B stop\fR, \fBkill\fR, \fBrm
+Stop, kill, or remove containers.
+.TP
+.B logs
+Fetch container logs. Supports
+.BR \-\-follow " (short " \-f ),
+.BR \-\-tail .
+.TP
+.B exec
+Run a command in a running container. Supports
+.BR \-i ,
+.BR \-t .
+.TP
+.B rmi\fR, \fBtag\fR, \fBcp
+Remove/tag images; copy files between a container and the host.
+.TP
+.B network
+Manage networks (create, inspect, list, remove, connect, disconnect, prune).
+.TP
+.B volume
+Manage volumes (create, inspect, list, remove, prune).
+.TP
+.B system
+Daemon-wide information and space reclamation.
+.TP
+.B build
+Build an image from a Dockerfile:
+.BR \-t ,
+.BR \-f ,
+.BR \-\-no\-cache ,
+.BR \-\-no\-cache\-filter ,
+.BR \-\-secret ,
+.BR \-q .
+.TP
+.B compose
+Docker Compose (up, down, ps, logs). Services support
+.B pull_policy
+and health/completion-gated
+.BR depends_on .
+.TP
+.B doctor
+Check system requirements and engine health (socket, cgroup v2,
+overlayfs, iproute2, iptables, seccomp, data paths, schema marker).
+.TP
+.B completions
+Generate shell completions.
+.SH FILES
+.TP
+.I /run/ingot/ingot.sock
+Daemon socket. Anyone with access has effective root on the host.
+.TP
+.I ~/.config/ingot/auth.json
+Stored registry credentials (mode 0600).
+.SH SEE ALSO
+.BR ingotd (1),
+.BR docker (1)
+.SH NOTES
+Ingot targets the Docker Engine API v1.44 surface documented in
+.IR docs/DOCKER_MATRIX.md .
+Unsupported options fail with an explicit error instead of being
+silently ignored.

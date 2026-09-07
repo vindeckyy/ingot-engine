@@ -88,12 +88,33 @@ fn human_size(bytes: i64) -> String {
     }
 }
 
+/// Output format for list commands. `table` is the human default;
+/// `json` prints one raw object per line for scripting. Anything else —
+/// including Go templates — is rejected with the accepted values named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListFormat {
+    Table,
+    Json,
+}
+
+pub fn parse_list_format(s: Option<&str>) -> Result<Option<ListFormat>> {
+    match s {
+        None => Ok(None),
+        Some("table") => Ok(Some(ListFormat::Table)),
+        Some("json") => Ok(Some(ListFormat::Json)),
+        Some(other) => Err(anyhow!(
+            "unsupported --format {other:?} (expected \"table\" or \"json\"; Go templates are not supported)"
+        )),
+    }
+}
+
 pub async fn ps(
     api: &ApiClient,
     all: bool,
     quiet: bool,
     no_trunc: bool,
     filters: &[String],
+    format: Option<&str>,
 ) -> Result<()> {
     let mut url = format!("/containers/json?all={}", if all { 1 } else { 0 });
     if !filters.is_empty() {
@@ -113,6 +134,13 @@ pub async fn ps(
         ));
     }
     let list: Vec<serde_json::Value> = api.get_json(&url).await?;
+    let format = parse_list_format(format)?;
+    if format == Some(ListFormat::Json) && !quiet {
+        for c in &list {
+            println!("{}", serde_json::to_string(c)?);
+        }
+        return Ok(());
+    }
     if quiet {
         for c in &list {
             let id = c["Id"].as_str().unwrap_or("");
@@ -164,6 +192,7 @@ pub async fn images(
     quiet: bool,
     no_trunc: bool,
     filters: &[String],
+    format: Option<&str>,
 ) -> Result<()> {
     let mut url = "/images/json".to_string();
     if !filters.is_empty() {
@@ -183,6 +212,13 @@ pub async fn images(
         ));
     }
     let list: Vec<serde_json::Value> = api.get_json(&url).await?;
+    let format = parse_list_format(format)?;
+    if format == Some(ListFormat::Json) && !quiet {
+        for img in &list {
+            println!("{}", serde_json::to_string(img)?);
+        }
+        return Ok(());
+    }
     if quiet {
         for img in &list {
             let id = img["Id"]
@@ -309,6 +345,47 @@ pub async fn pull(api: &ApiClient, image: &str, platform: Option<&str>) -> Resul
     let resp = api
         .request_with_headers("POST", &url, None, &header_refs)
         .await?;
+    stream_progress(resp, "pull").await
+}
+
+/// POST /images/{name}/push and print the docker-style progress stream.
+pub async fn push(api: &ApiClient, image: &str) -> Result<()> {
+    let (name, tag) = push_path(image)?;
+    let mut url = format!("/images/{name}/push");
+    if let Some(t) = tag {
+        url.push_str(&format!("?tag={}", url_escape(&t)));
+    }
+    let mut headers: Vec<(&str, String)> = Vec::new();
+    let auth_value;
+    if let Some(a) = crate::auth::auth_header_for_image(image)? {
+        auth_value = a;
+        headers.push(("X-Registry-Auth", auth_value.clone()));
+    }
+    let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let resp = api
+        .request_with_headers("POST", &url, None, &header_refs)
+        .await?;
+    stream_progress(resp, "push").await
+}
+
+/// Split a push reference into the URL path name (registry-qualified repo,
+/// `/` encoded for the single-segment `{name}` route) and the tag query.
+/// Digest-only references carry no tag: the daemon defaults those to
+/// `latest`, the same default docker applies.
+pub fn push_path(image: &str) -> Result<(String, Option<String>)> {
+    let parsed = ingot_registry::ImageRef::parse(image)?;
+    let repo = if parsed.registry_is_default() {
+        parsed.repo.clone()
+    } else {
+        format!("{}/{}", parsed.registry, parsed.repo)
+    };
+    Ok((path_escape(&repo), parsed.tag.clone()))
+}
+
+/// Print a daemon progress stream (pull/push): `status` lines to stdout,
+/// `stream` chunks inline, `error` lines to stderr. Any error line fails
+/// the command once the stream ends.
+async fn stream_progress(resp: hyper::Response<hyper::body::Incoming>, action: &str) -> Result<()> {
     let mut had_error = false;
     crate::client::stream_lines(resp, |v| {
         if let Some(status) = v["status"].as_str() {
@@ -328,7 +405,7 @@ pub async fn pull(api: &ApiClient, image: &str, platform: Option<&str>) -> Resul
     })
     .await?;
     if had_error {
-        return Err(anyhow!("pull failed"));
+        return Err(anyhow!("{action} failed"));
     }
     Ok(())
 }
@@ -1163,6 +1240,13 @@ fn url_escape(s: &str) -> String {
     out
 }
 
+/// Path-segment escaping for `/images/{name}/...` routes: like
+/// `url_escape`, but `/` encodes too so a namespaced repo stays one
+/// segment (axum percent-decodes it back before the handler sees it).
+fn path_escape(s: &str) -> String {
+    url_escape(s).replace('/', "%2F")
+}
+
 pub async fn doctor(api: &ApiClient, socket_path: &std::path::Path) -> Result<()> {
     println!("Checking Ingot system requirements and health...\n");
     let mut all_ok = true;
@@ -1258,6 +1342,24 @@ pub async fn doctor(api: &ApiClient, socket_path: &std::path::Path) -> Result<()
             } else {
                 println!("WARN (seccomp profile not reported)");
             }
+
+            // 8. data-root schema marker (read-only; WARN, never FAIL:
+            // doctor often runs without the daemon's file permissions).
+            print!("  [..] data-root schema: ");
+            let marker = std::path::Path::new(root_dir).join("schema-version");
+            match std::fs::read_to_string(&marker) {
+                Ok(raw) => match raw.trim().parse::<u32>() {
+                    Ok(v) => println!("OK (version {v})"),
+                    Err(_) => println!(
+                        "WARN (unparsable marker {}; back up before touching it)",
+                        marker.display()
+                    ),
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!("WARN (no schema marker yet; written on first daemon boot)")
+                }
+                Err(e) => println!("SKIP (cannot read {}: {e})", marker.display()),
+            }
         }
         Err(_) => {
             println!("SKIP (daemon not reachable)");
@@ -1270,5 +1372,56 @@ pub async fn doctor(api: &ApiClient, socket_path: &std::path::Path) -> Result<()
         Ok(())
     } else {
         Err(anyhow!("One or more preflight checks failed"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_path_splits_name_and_tag() {
+        // Default registry drops the host; the repo keeps its slashes
+        // encoded for the single-segment route.
+        assert_eq!(
+            push_path("busybox:1.36").unwrap(),
+            ("library%2Fbusybox".to_string(), Some("1.36".to_string()))
+        );
+        assert_eq!(
+            push_path("myuser/myapp").unwrap(),
+            ("myuser%2Fmyapp".to_string(), Some("latest".to_string()))
+        );
+        // Custom registries stay qualified, ports intact.
+        assert_eq!(
+            push_path("127.0.0.1:5000/team/app:dev").unwrap(),
+            (
+                "127.0.0.1:5000%2Fteam%2Fapp".to_string(),
+                Some("dev".to_string())
+            )
+        );
+        // Digest-only references carry no tag for the query.
+        let (name, tag) = push_path(
+            "busybox@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        assert_eq!(name, "library%2Fbusybox");
+        assert_eq!(tag, None);
+        assert!(push_path("").is_err());
+    }
+
+    #[test]
+    fn list_format_parsing() {
+        assert_eq!(parse_list_format(None).unwrap(), None);
+        assert_eq!(
+            parse_list_format(Some("table")).unwrap(),
+            Some(ListFormat::Table)
+        );
+        assert_eq!(
+            parse_list_format(Some("json")).unwrap(),
+            Some(ListFormat::Json)
+        );
+        // Go templates and anything else fail closed with guidance.
+        let err = parse_list_format(Some("{{.ID}}")).unwrap_err().to_string();
+        assert!(err.contains("table") && err.contains("json"), "{err}");
     }
 }

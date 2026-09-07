@@ -38,7 +38,7 @@ DAEMON_PID=""
 
 start_daemon() {
     info "Starting daemon (data=$DATA_DIR, socket=$SOCKET)..."
-    "$INGOTD_BIN" --data-root "$DATA_DIR" --run-root "$RUN_DIR" --listen "unix://$SOCKET" &
+    "$INGOTD_BIN" --data-root "$DATA_DIR" --run-root "$RUN_DIR" --socket "$SOCKET" &
     DAEMON_PID=$!
     for i in $(seq 1 30); do
         if curl -s --unix-socket "$SOCKET" http://localhost/_ping 2>/dev/null | grep -q "OK"; then
@@ -67,9 +67,9 @@ cleanup() {
 trap cleanup EXIT
 
 DOCKER_CLI="$TEST_ROOT/dk"
-cat << 'INNER' > "$DOCKER_CLI"
+cat << INNER > "$DOCKER_CLI"
 #!/usr/bin/env bash
-exec docker -H "unix://$SOCKET" "$@"
+exec docker -H "unix://$SOCKET" "\$@"
 INNER
 chmod +x "$DOCKER_CLI"
 

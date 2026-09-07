@@ -84,6 +84,8 @@ enum Cmd {
         #[arg(long)]
         platform: Option<String>,
     },
+    /// Push a local image to a registry
+    Push { image: String },
     /// Store registry credentials for later pulls
     Login {
         /// Registry host (defaults to Docker Hub)
@@ -118,6 +120,9 @@ enum Cmd {
         /// Filter values (e.g. "name=web", "status=running", "label=k=v")
         #[arg(short = 'f', long)]
         filter: Vec<String>,
+        /// Output format: "table" (default) or "json" (one object per line)
+        #[arg(long)]
+        format: Option<String>,
     },
     /// List images
     #[command(alias = "image ls")]
@@ -131,6 +136,9 @@ enum Cmd {
         /// Filter values (e.g. "dangling=true", "reference=busybox", "label=k=v")
         #[arg(short = 'f', long)]
         filter: Vec<String>,
+        /// Output format: "table" (default) or "json" (one object per line)
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Stop one or more running containers
     Stop { containers: Vec<String> },
@@ -329,6 +337,9 @@ pub enum ComposeSubcmd {
         /// Build images before starting containers
         #[arg(long)]
         build: bool,
+        /// Enable a compose profile (repeatable; also COMPOSE_PROFILES)
+        #[arg(long = "profile")]
+        profile: Vec<String>,
     },
     /// Stop and remove containers, networks
     Down {
@@ -341,6 +352,9 @@ pub enum ComposeSubcmd {
         /// Show all stopped and running containers
         #[arg(short = 'a', long)]
         all: bool,
+        /// Show which compose profiles are active
+        #[arg(long = "profile")]
+        profile: Vec<String>,
     },
     /// View output from containers
     Logs {
@@ -438,6 +452,7 @@ async fn main() -> Result<()> {
             commands::run(&api, &opts, &image, cmd).await
         }
         Cmd::Pull { image, platform } => commands::pull(&api, &image, platform.as_deref()).await,
+        Cmd::Push { image } => commands::push(&api, &image).await,
         Cmd::Login {
             server,
             username,
@@ -458,12 +473,14 @@ async fn main() -> Result<()> {
             quiet,
             no_trunc,
             filter,
-        } => commands::ps(&api, all, quiet, no_trunc, &filter).await,
+            format,
+        } => commands::ps(&api, all, quiet, no_trunc, &filter, format.as_deref()).await,
         Cmd::Images {
             quiet,
             no_trunc,
             filter,
-        } => commands::images(&api, quiet, no_trunc, &filter).await,
+            format,
+        } => commands::images(&api, quiet, no_trunc, &filter, format.as_deref()).await,
         Cmd::Stop { containers } => commands::stop(&api, &containers).await,
         Cmd::Kill { container } => commands::kill(&api, &container).await,
         Cmd::Rm { force, containers } => commands::rm(&api, force, &containers).await,
@@ -508,14 +525,26 @@ async fn main() -> Result<()> {
             project,
             action,
         } => match action {
-            ComposeSubcmd::Up { detach, build } => {
-                compose::up(&api, file.as_deref(), project.as_deref(), detach, build).await
+            ComposeSubcmd::Up {
+                detach,
+                build,
+                profile,
+            } => {
+                compose::up(
+                    &api,
+                    file.as_deref(),
+                    project.as_deref(),
+                    detach,
+                    build,
+                    &profile,
+                )
+                .await
             }
             ComposeSubcmd::Down { volumes } => {
                 compose::down(&api, file.as_deref(), project.as_deref(), volumes).await
             }
-            ComposeSubcmd::Ps { all } => {
-                compose::ps(&api, file.as_deref(), project.as_deref(), all).await
+            ComposeSubcmd::Ps { all, profile } => {
+                compose::ps(&api, file.as_deref(), project.as_deref(), all, &profile).await
             }
             ComposeSubcmd::Logs { follow, services } => {
                 compose::logs(&api, file.as_deref(), project.as_deref(), follow, &services).await

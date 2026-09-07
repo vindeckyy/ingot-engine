@@ -68,6 +68,17 @@ if [ -d "$FISH_COMP_DIR" ]; then
     "$TARGET_INGOT" completions fish > "$FISH_COMP_DIR/ingot.fish" 2>/dev/null || true
 fi
 
+echo "==> Installing man pages"
+MAN1_DIR="$DESTDIR$PREFIX/share/man/man1"
+MAN8_DIR="$DESTDIR$PREFIX/share/man/man8"
+install -d "$MAN1_DIR" "$MAN8_DIR" 2>/dev/null || true
+if [ -d "$MAN1_DIR" ]; then
+    install -m 0644 docs/man/ingot.1 "$MAN1_DIR/ingot.1" 2>/dev/null || true
+fi
+if [ -d "$MAN8_DIR" ]; then
+    install -m 0644 docs/man/ingotd.8 "$MAN8_DIR/ingotd.8" 2>/dev/null || true
+fi
+
 if [ "$INSTALL_SERVICE" = 1 ]; then
     SYSTEMD_DIR="$DESTDIR/etc/systemd/system"
     echo "==> Installing systemd unit to $SYSTEMD_DIR"

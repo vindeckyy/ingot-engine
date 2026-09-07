@@ -1,0 +1,62 @@
+.TH INGOTD 8 "2026-09-07" "ingot 0.1.0" "System Administration"
+.SH NAME
+ingotd \- Ingot container engine daemon
+.SH SYNOPSIS
+.B ingotd
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B ingotd
+is the Ingot container engine daemon. It must run as root: it creates
+namespaces, mount tables, cgroups, and firewall rules directly, with no
+external runtime. Per-flag help is authoritative:
+.B "ingotd \-\-help" .
+.SH OPTIONS
+.TP
+.BR \-\-data\-root " \fIPATH\fR"
+Persistent state root (default \fI/var/lib/ingot\fR).
+.TP
+.BR \-\-run\-root " \fIPATH\fR"
+Runtime state root (default \fI/run/ingot\fR).
+.TP
+.BR \-\-socket " \fIPATH\fR"
+Unix socket path (default \fI/run/ingot/ingot.sock\fR).
+.TP
+.BR \-\-bridge " \fINAME\fR"
+Default bridge interface name (default \fIingot0\fR).
+.TP
+.BR \-\-socket\-group " \fIGROUP\fR"
+Group owner for the Unix socket. Unset means mode 0600 root-only.
+Anyone with socket access has effective root on the host.
+.TP
+.BR \-\-config " \fIPATH\fR"
+JSON config file with the same keys as the flags (docker's
+\fIdaemon.json\fR equivalent). Precedence per key: CLI flag, then
+config file, then built-in default. Unknown keys fail the boot.
+.TP
+.BR \-\-debug
+Verbose logging.
+.TP
+.BR \-\-fsck
+Verify image-store consistency (read-only) and exit.
+.TP
+.BR \-\-repair
+Verify and repair the image store, then exit. Refuses while the
+daemon is live.
+.SH STARTUP
+On boot the daemon reconciles persisted state: stale
+.BR Running / Paused
+containers are marked exited and their mounts, cgroups, veth pairs,
+DNS registrations, and firewall rules are cleaned up. Unless-stopped
+and always restart-policy containers are restarted. A second daemon
+on the same data root is refused by an exclusive lock.
+.SH FILES
+.TP
+.I /var/lib/ingot
+Data root: images, containers, volumes, networks, builder cache, and
+the \fIschema-version\fR marker.
+.TP
+.I /run/ingot/ingot.sock
+API socket.
+.SH SEE ALSO
+.BR ingot (1),
+.BR docker (8)

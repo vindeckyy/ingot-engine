@@ -43,3 +43,47 @@ Include in your report:
 - Read-only rootfs, masked paths, and no-new-privileges are supported per container.
 - Image unpack validates tar entries and rejects path traversal. Whiteout markers are applied before the layer is committed.
 - Registry downloads verify digests against the manifest before blobs are committed to CAS.
+
+## Audit-Scope Brief (Pre-Audit)
+
+Status: no external audit has been performed. The surfaces below are
+the audit scope when one is scheduled; the evidence column names the
+in-tree proof that exists today.
+
+Trust boundaries:
+
+- Unix socket (`/run/ingot/ingot.sock`) → effective root. Socket file
+  permissions/group are the only gate. Evidence: `serve.rs` bind,
+  `--socket-group`, `SECURITY.md` threat model.
+- Container → host: namespaces, pivot-root, capability drops,
+  no-new-privs, seccomp allowlist, masked/readonly `/proc`+`/sys`.
+  Evidence: `crates/runtime/src/child.rs`, `seccomp.rs`, matrix tests
+  in `crates/runtime/src/error.rs`.
+- Registry → daemon: TLS, Bearer [REDACTED] negotiation, manifest
+  digest pinning, blob hash verification, platform-digest checks.
+  Evidence: `crates/registry/src/client.rs`, `crates/image/src/pull.rs`.
+- Build secrets → image: values materialized outside the diff dir,
+  excluded from cache keys and history rows. Evidence:
+  `history_rendering_and_secret_hygiene` test in
+  `crates/builder/src/build.rs`.
+
+Privileged surfaces requiring review:
+
+- `crates/runtime/src/child.rs` `unsafe` blocks (~27 syscall-scoped
+  sites): namespace setup, pivot-root, capability and user switching.
+- `crates/runtime/src/seccomp.rs`: allowlist completeness vs
+  default-deny intent; per-syscall rationale comments.
+- Archive extraction (`crates/image/src/unpack.rs`): symlink/hardlink
+  escape, device nodes, setuid, `/proc`+`/sys` writes; covered by
+  `fuzz_archive_unpack` plus unit tests.
+- Firewall/NAT programming (`crates/network/src/lib.rs`): rule
+  lifecycle, orphan cleanup, boot reconciliation.
+- API validation (`crates/runtime/src/error.rs`,
+  `crates/server/src/handlers/`): every accepted option enforced or
+  explicitly rejected; negative-option matrix tests.
+
+Pre-audit checklist: close the open hardening items (device plumbing
+is reject-only; `push`/Swarm/plugins absent by design), run the
+Tier-2 suites on a host that permits nsfs bind mounts, and execute a
+longer fuzz campaign over the five `fuzz/` targets before engaging
+reviewers.
